@@ -42,3 +42,19 @@ bin/openclaw-rollback
 ```
 
 Do not use `npm install -g openclaw` after migration; use `openclaw-update stage` + `openclaw-update promote`.
+
+## Environment variable overrides
+
+All scripts respect these env vars for path discovery. Useful on non-standard installs (Linux npm global, nvm, custom prefix):
+
+| Variable | Default | Description |
+|---|---|---|
+| `OPENCLAW_NODE` | `process.execPath` | Path to the node binary |
+| `OPENCLAW_NPM` | sibling of node binary, then `which npm` | Path to the npm binary |
+| `OPENCLAW_INSTALL_DIR` | `npm root -g`/openclaw (verified via `openclaw.mjs`) | Path to the openclaw package directory (the dir containing `openclaw.mjs`) |
+
+Example for a git-checkout install where openclaw isn't on npm global:
+
+```bash
+OPENCLAW_INSTALL_DIR=~/src/openclaw bin/openclaw-update status
+```

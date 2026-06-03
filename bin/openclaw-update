@@ -17,9 +17,6 @@ const VERSIONS_DIR = resolve(OPENCLAW_DIR, 'versions');
 const CURRENT_LINK = resolve(OPENCLAW_DIR, 'current');
 const PREVIOUS_LINK = resolve(OPENCLAW_DIR, 'previous');
 const MANIFEST = resolve(OPENCLAW_DIR, 'versions-manifest.json');
-const NODE = '/opt/homebrew/bin/node';
-const NPM = '/opt/homebrew/bin/npm';
-const BREW_INSTALL = '/opt/homebrew/lib/node_modules/openclaw';
 const GATEWAY_LABEL = 'ai.openclaw.gateway';
 const GATEWAY_PLIST = resolve(homedir(), `Library/LaunchAgents/${GATEWAY_LABEL}.plist`);
 const CLAWD_DIR = resolve(homedir(), 'clawd');
@@ -45,7 +42,12 @@ Commands:
 
 Safety:
   migrate-to-versioned.sh performs the one-time switchover. Promote/cleanup require --yes.
-  This CLI never changes ~/.openclaw state for check/status/smoketest.`);
+  This CLI never changes ~/.openclaw state for check/status/smoketest.
+
+Environment overrides:
+  OPENCLAW_NODE         Path to node binary (default: process.execPath)
+  OPENCLAW_NPM          Path to npm binary (default: sibling of node binary, or which npm)
+  OPENCLAW_INSTALL_DIR  Path to openclaw package directory (the dir containing openclaw.mjs)`);
 }
 
 function parse(argv) {
@@ -78,6 +80,36 @@ function run(cmd, argv, opts = {}) {
   return r;
 }
 
+function detectInstall() {
+  const node = process.env.OPENCLAW_NODE || process.execPath;
+
+  let npm;
+  if (process.env.OPENCLAW_NPM) {
+    npm = process.env.OPENCLAW_NPM;
+  } else {
+    const npmSibling = resolve(dirname(node), 'npm');
+    if (existsSync(npmSibling)) {
+      npm = npmSibling;
+    } else {
+      const r = spawnSync('which', ['npm'], { encoding: 'utf8', timeout: 5000 });
+      npm = r.status === 0 ? r.stdout.trim() : 'npm';
+    }
+  }
+
+  let installDir = process.env.OPENCLAW_INSTALL_DIR || null;
+  if (!installDir) {
+    const r = spawnSync(npm, ['root', '-g'], { encoding: 'utf8', timeout: 15000 });
+    if (r.status === 0 && r.stdout.trim()) {
+      const candidate = resolve(r.stdout.trim(), 'openclaw');
+      if (existsSync(resolve(candidate, 'openclaw.mjs'))) installDir = candidate;
+    }
+  }
+
+  return { NODE: node, NPM: npm, INSTALL_DIR: installDir };
+}
+
+const { NODE, NPM, INSTALL_DIR } = detectInstall();
+
 function versionFromOutput(s) {
   return (s || '').match(/(\d{4}\.\d+\.\d+)/)?.[1] ?? null;
 }
@@ -94,8 +126,8 @@ function currentVersion() {
     if (pkg && existsSync(pkg)) return JSON.parse(readFileSync(pkg, 'utf8')).version;
     return target ? basename(target).replace(/\.broken-.*/, '') : null;
   }
-  const entry = resolve(BREW_INSTALL, 'openclaw.mjs');
-  if (existsSync(entry)) {
+  const entry = INSTALL_DIR && resolve(INSTALL_DIR, 'openclaw.mjs');
+  if (entry && existsSync(entry)) {
     const r = run(NODE, [entry, '--version'], { timeout: 10000 });
     return versionFromOutput(r.stdout || r.stderr);
   }
@@ -177,7 +209,7 @@ function packageDir(version) {
 
 function installDirForCurrent() {
   if (existsSync(CURRENT_LINK) && lstatSync(CURRENT_LINK).isSymbolicLink()) return resolve(CURRENT_LINK, 'lib/node_modules/openclaw');
-  return BREW_INSTALL;
+  return INSTALL_DIR;
 }
 
 function output(obj, args, text) {
@@ -300,7 +332,7 @@ function cmdStage(args) {
   const r = run(NPM, ['install', '--prefix', dir, `openclaw@${version}`], { stdio: 'inherit', timeout: 300000 });
   if (r.status !== 0) throw new Error(`npm install failed with ${r.status}`);
   mkdirSync(resolve(dir, 'bin'), { recursive: true });
-  try { writeFileSync(resolve(dir, 'bin/openclaw'), `#!/bin/sh\nexec /opt/homebrew/bin/node \"${resolve(packageDir(version), 'openclaw.mjs')}\" \"$@\"\n`); } catch {}
+  try { writeFileSync(resolve(dir, 'bin/openclaw'), `#!/bin/sh\nexec "${NODE}" "${resolve(packageDir(version), 'openclaw.mjs')}" "$@"\n`); } catch {}
   // Compat: launchd plist + the global wrapper still reference the legacy layout
   // `<version>/lib/node_modules/openclaw/...`. npm install --prefix produces
   // `<version>/node_modules/openclaw/...`. We need a path shim that works for
