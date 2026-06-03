@@ -56,14 +56,9 @@ if [[ -f "$PLIST" ]] && grep -q "OPENCLAW_DISABLE_BONJOUR" "$PLIST" && \
   ENV_GUARD=1
 fi
 if [[ -f "$OPENCLAW_DIR/openclaw.json" ]]; then
-  CFG_GUARD=$(python3 -c "
-import json
-try:
-  c = json.load(open('$OPENCLAW_DIR/openclaw.json'))
-  print(1 if c.get('discovery',{}).get('mdns',{}).get('mode') == 'off' else 0)
-except Exception:
-  print(0)
-" 2>/dev/null || echo 0)
+  if node -e "const c=JSON.parse(require('fs').readFileSync('$OPENCLAW_DIR/openclaw.json','utf8'));process.exit(c?.discovery?.mdns?.mode==='off'?0:1)" 2>/dev/null; then
+    CFG_GUARD=1
+  fi
 fi
 if [[ "$ENV_GUARD" != "1" && "$CFG_GUARD" != "1" ]]; then
   echo ""
