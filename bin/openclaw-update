@@ -544,7 +544,7 @@ async function cmdPromote(args) {
   if (!existsSync(packageDir(version))) throw new Error(`version is not staged: ${version}. Run openclaw-update stage ${version}`);
   const oldTarget = existsSync(CURRENT_LINK) ? readlink(CURRENT_LINK) : null;
   const oldVersion = oldTarget ? basename(oldTarget) : currentVersion();
-  console.log(`Promoting ${oldVersion ?? 'unknown'} → ${version}`);
+  if (!args.stepBase) console.log(`Promoting ${oldVersion ?? 'unknown'} → ${version}`);
   if (args.dryRun) { console.log(`[dry-run] would set current -> versions/${version}, restart gateway, run smoketest`); return; }
 
   mkdirSync(OPENCLAW_DIR, { recursive: true });
@@ -563,12 +563,16 @@ async function cmdPromote(args) {
     run('ln', ['-sfn', `versions/${oldVersion}`, 'previous']);
   }
   const cfg = resolve(OPENCLAW_DIR, 'openclaw.json');
-  if (existsSync(cfg)) cpSync(cfg, resolve(OPENCLAW_DIR, `openclaw.json.pre-promote-${new Date().toISOString().replace(/[:.]/g, '-')}`), { force: true });
+  if (existsSync(cfg)) {
+    const backupName = `openclaw.json.pre-promote-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+    cpSync(cfg, resolve(OPENCLAW_DIR, backupName), { force: true });
+    if (args.stepBase) console.log(`[${args.stepBase}a/6]   Backing up openclaw.json → ${backupName}`);
+  }
 
   // §13.2 — Snapshot config state into the OLD version's dir before we leave it.
   // On future rollback, this is what restores the openclaw.json that old version expects.
   if (oldTarget && existsSync(oldTarget)) {
-    console.log(`Snapshotting ~/.openclaw config into versions/${oldVersion}/.state-snapshot/`);
+    if (!args.stepBase) console.log(`Snapshotting ~/.openclaw config into versions/${oldVersion}/.state-snapshot/`);
     try { snapshotState(oldTarget); }
     catch (err) { console.log(`  snapshot warning: ${err.message}`); }
   }
@@ -578,14 +582,24 @@ async function cmdPromote(args) {
 
   process.chdir(OPENCLAW_DIR);
   run('ln', ['-sfn', `versions/${version}`, 'current']);
+  if (args.stepBase) console.log(`[${args.stepBase}b/6]   Swapping symlink → current → ${version}`);
   addEvent({ event: 'promote', current: version, previous: oldVersion, path: target, clawdTag });
 
   try {
     restartGateway();
+    if (args.stepBase) console.log(`[${args.stepBase}c/6]   Reloading launchd → kickstart ok`);
     const report = await runSmoketest({ target: 'current', mode: 'quick', installDir: packageDir(version), configDir: OPENCLAW_DIR, port: 18789, models: args.withModels });
-    console.log(formatTextReport(report));
+    if (args.stepBase) {
+      const total = report.passed + report.failed;
+      const failDetail = report.failed
+        ? ` (${report.results.filter(r => !r.ok).map(f => `#${String(f.id).padStart(2, '0')} ${f.name}: ${f.detail}`).join(', ')})`
+        : '';
+      console.log(`[${args.stepBase}d/6]   Live smoke test → ${report.passed}/${total} passed${failDetail}`);
+    } else {
+      console.log(formatTextReport(report));
+    }
     if (report.failed) throw new Error('post-promote smoketest failed');
-    console.log(`Promote successful: ${version}`);
+    if (!args.stepBase) console.log(`Promote successful: ${version}`);
     const okCount = report.passed;
     const totalCount = report.passed + report.failed;
     await announceToDM(
@@ -672,7 +686,7 @@ async function cmdInteractive(args) {
     process.exit(0);
   }
 
-  await cmdPromote({ ...args, _: ['promote', latest], yes: true });
+  await cmdPromote({ ...args, _: ['promote', latest], yes: true, stepBase: '4' });
 
   console.log('[5/6] Promote successful.');
   console.log(`[6/6] Previous version retained at ~/.openclaw/versions/${current}/. Rollback: openclaw-rollback`);
