@@ -22,7 +22,7 @@ const NPM = '/opt/homebrew/bin/npm';
 const BREW_INSTALL = '/opt/homebrew/lib/node_modules/openclaw';
 const GATEWAY_LABEL = 'ai.openclaw.gateway';
 const GATEWAY_PLIST = resolve(homedir(), `Library/LaunchAgents/${GATEWAY_LABEL}.plist`);
-const CLAWD_DIR = resolve(homedir(), 'clawd');
+const WORKSPACE_GIT = process.env.OPENCLAW_UPDATE_WORKSPACE_GIT ?? null;
 const SNAPSHOT_HELPER = resolve(ROOT, 'lib/state-snapshot.sh');
 
 function usage() {
@@ -210,24 +210,20 @@ function changelogDiff(latest, current) {
 }
 
 function interpretPrompt(current, latest) {
-  return `An OpenClaw update from ${current} to ${latest} is available. Below is the changelog diff between these releases. Your job: decide whether ANYTHING in here is something Stephan should care about, and if so summarize.
-
-Stephan's setup:
-- Primary model: Anthropic Claude Opus 4.7 (anthropic/claude-opus-4-7).
-- Fallback: Anthropic Sonnet 4.6; also configured: Google Gemini, OpenAI Codex GPT-5.5.
-- Primary channels: Telegram (heavy use), Moby-Dock terminal, Jump Desktop.
-- Known pain points he has hit: Bonjour "CIAO ANNOUNCEMENT CANCELLED" crash loop (using OPENCLAW_DISABLE_BONJOUR=1 workaround); openclaw.json being clobbered by updates; gateway dying silently after updates.
-- Uses: alert-bus, heartbeat, Telegram topic routing, skills, MCP.
+  const userContext = process.env.OPENCLAW_UPDATE_INTERPRET_CONTEXT
+    ? `\n\nUser-provided context:\n${process.env.OPENCLAW_UPDATE_INTERPRET_CONTEXT}`
+    : '';
+  return `An OpenClaw update from ${current} to ${latest} is available. Below is the changelog diff between these releases. Your job: decide whether ANYTHING in here warrants attention, and if so summarize.${userContext}
 
 Output a single JSON object (no markdown, no extra text):
 {
   "summary": "item1; item2; item3",   // 3-5 short phrases, semicolon-separated, ≤50 chars each. Empty string if NOTHING is interesting.
-  "noteworthy": true|false,            // true ONLY if a TRULY compelling reason to update *today* (e.g., NEW MAJOR MODEL like Opus 4.8 / Sonnet 5; fix for a crash bug he has actually hit; critical security CVE). Polish, incremental plugin work, and unrelated provider integrations are NEVER noteworthy.
-  "breaking": true|false,             // true if this update requires manual action BEFORE promoting (e.g., openclaw.json schema migration, removed config field he relies on, changed behavior in Telegram routing/skills/MCP that would require config adjustment). False for standard updates even when there are behavior changes.
+  "noteworthy": true|false,            // true ONLY if a TRULY compelling reason to update today (e.g., new major model support, fix for a crash bug, critical security CVE). Polish, incremental plugin work, and unrelated provider integrations are NEVER noteworthy.
+  "breaking": true|false,             // true if this update requires manual action BEFORE promoting (e.g., openclaw.json schema migration, removed config field, changed behavior in routing/skills/MCP that would require config adjustment). False for standard updates even when there are behavior changes.
   "breaking_notes": ""                // If breaking: true, one sentence describing exactly what manual step is needed before running openclaw-update promote. Empty string if breaking: false.
 }
 
-Be ruthless. The defaults are noteworthy: false, breaking: false. Most updates require no manual intervention. Only set "breaking" to true if you can identify a specific action Stephan must take before the gateway will restart cleanly on his existing config. Deprecation warnings alone are not breaking — only changes that would cause the gateway to fail or misbehave on startup.`;
+Be ruthless. The defaults are noteworthy: false, breaking: false. Most updates require no manual intervention. Only set "breaking" to true if you can identify a specific action the user must take before the gateway will restart cleanly on the existing config. Deprecation warnings alone are not breaking — only changes that would cause the gateway to fail or misbehave on startup.`;
 }
 
 async function cmdCheck(args) {
@@ -459,43 +455,42 @@ function snapshotState(versionDirPath) {
   process.stdout.write(r.stdout);
 }
 
-const DM_CHAT_ID = 8290418965;
-const ALERT_BUS_TG = resolve(homedir(), 'clawd/moby-os/intelligence/alert-bus/lib/telegram-post.mjs');
-
-async function announceToDM(text) {
+async function notify(text) {
+  const cmd = process.env.OPENCLAW_UPDATE_NOTIFY_CMD;
+  if (!cmd) {
+    process.stderr.write(`[openclaw-update] ${text}\n`);
+    return;
+  }
   try {
-    const { sendMessage } = await import(ALERT_BUS_TG);
-    const r = await sendMessage({ chat_id: DM_CHAT_ID, thread_id: null, text });
-    if (!r.ok) console.log(`  notify failed (non-fatal): ${r.reason}`);
-    else console.log(`  posted to DM (message_id=${r.message_id})`);
+    const payload = JSON.stringify({ source: 'openclaw-update', message: text, timestamp: new Date().toISOString() });
+    const r = spawnSync('sh', ['-c', cmd], { input: payload, encoding: 'utf8', timeout: 10000 });
+    if (r.status !== 0) process.stderr.write(`[notify] command failed (non-fatal): ${(r.stderr || r.stdout || '').trim().slice(0, 200)}\n`);
   } catch (err) {
-    console.log(`  notify skipped (non-fatal): ${err.message}`);
+    process.stderr.write(`[notify] skipped (non-fatal): ${err.message}\n`);
   }
 }
 
 function tagClawdGit(oldVersion, newVersion) {
-  if (!existsSync(resolve(CLAWD_DIR, '.git'))) {
-    console.log('  ~/clawd is not a git repo — skipping git tag');
-    return null;
-  }
+  if (!WORKSPACE_GIT) return null;
+  if (!existsSync(resolve(WORKSPACE_GIT, '.git'))) return null;
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
   const tagName = `openclaw-update-pre-${ts}-from-${oldVersion}-to-${newVersion}`;
-  const status = spawnSync('git', ['-C', CLAWD_DIR, 'status', '--porcelain'], { encoding: 'utf8', timeout: 10000 });
+  const status = spawnSync('git', ['-C', WORKSPACE_GIT, 'status', '--porcelain'], { encoding: 'utf8', timeout: 10000 });
   const dirty = (status.stdout || '').trim().length > 0;
   if (dirty) {
-    console.log('  ~/clawd has uncommitted changes — committing them so the tag is meaningful');
-    spawnSync('git', ['-C', CLAWD_DIR, 'add', '-A'], { encoding: 'utf8', timeout: 30000 });
-    spawnSync('git', ['-C', CLAWD_DIR, 'commit', '-m', `wip: pre-openclaw-update-${newVersion}`], { encoding: 'utf8', timeout: 30000 });
+    console.log(`  ${WORKSPACE_GIT} has uncommitted changes — committing them so the tag is meaningful`);
+    spawnSync('git', ['-C', WORKSPACE_GIT, 'add', '-A'], { encoding: 'utf8', timeout: 30000 });
+    spawnSync('git', ['-C', WORKSPACE_GIT, 'commit', '-m', `wip: pre-openclaw-update-${newVersion}`], { encoding: 'utf8', timeout: 30000 });
   }
-  const tag = spawnSync('git', ['-C', CLAWD_DIR, 'tag', tagName], { encoding: 'utf8', timeout: 10000 });
+  const tag = spawnSync('git', ['-C', WORKSPACE_GIT, 'tag', tagName], { encoding: 'utf8', timeout: 10000 });
   if (tag.status !== 0) {
     console.log(`  git tag failed (non-fatal): ${(tag.stderr || tag.stdout).trim()}`);
     return null;
   }
   // Best-effort push, do not fail promote on push failure
-  const push = spawnSync('git', ['-C', CLAWD_DIR, 'push', 'origin', '--tags'], { encoding: 'utf8', timeout: 30000 });
-  if (push.status !== 0) console.log(`  git tag pushed locally only (push failed): ${(push.stderr || push.stdout).trim().slice(0, 120)}`);
-  else console.log(`  ~/clawd tagged: ${tagName} (pushed)`);
+  const push = spawnSync('git', ['-C', WORKSPACE_GIT, 'push', 'origin', '--tags'], { encoding: 'utf8', timeout: 30000 });
+  if (push.status !== 0) console.log(`  workspace tagged locally only (push failed): ${(push.stderr || push.stdout).trim().slice(0, 120)}`);
+  else console.log(`  workspace tagged: ${tagName} (pushed)`);
   return tagName;
 }
 
@@ -582,15 +577,15 @@ async function cmdPromote(args) {
     console.log(`Promote successful: ${version}`);
     const okCount = report.passed;
     const totalCount = report.passed + report.failed;
-    await announceToDM(
+    await notify(
       `OpenClaw ${version} is live. Live smoke test: ${okCount}/${totalCount} passed. Previous version retained at ~/.openclaw/versions/${oldVersion}/. Rollback: openclaw-rollback`
     );
   } catch (err) {
     console.error(`Promote failed: ${err.message}`);
     console.error('Attempting automatic rollback...');
     run(resolve(HERE, 'openclaw-rollback'), [], { stdio: 'inherit', timeout: 120000 });
-    await announceToDM(
-      `OpenClaw promote to ${version} FAILED: ${err.message.slice(0, 200)}. Auto-rolled back to ${oldVersion}. Check ~/clawd/clawd-resilience/openclaw-update/forensics/ for details.`
+    await notify(
+      `OpenClaw promote to ${version} FAILED: ${err.message.slice(0, 200)}. Auto-rolled back to ${oldVersion}.`
     );
     process.exit(1);
   }

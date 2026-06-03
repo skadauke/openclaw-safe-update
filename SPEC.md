@@ -14,7 +14,7 @@
 Current install: `npm install -g openclaw@latest` overwrites `/opt/homebrew/lib/node_modules/openclaw/` in place. No previous version exists to roll back to. Test = "is the gateway still up after the update?". Found-out-too-late failure.
 
 ### 1.2 Rescue-channel problem
-When the gateway dies, Telegram dies with it. That used to leave Stephan with no remote way to act. **Already solved** — Stephan has Jump Desktop + Moby-Dock as independent sudo-shell paths. We only need a one-command rollback inside that shell, not a separate Telegram bot.
+When the gateway dies, Telegram dies with it. That used to leave the operator with no remote way to act. **Already solved** — independent out-of-band shell access (e.g. a remote desktop or secondary terminal) provides the rescue path. We only need a one-command rollback inside that shell, not a separate Telegram bot.
 
 These two problems shape everything below.
 
@@ -61,7 +61,7 @@ Each `versions/<version>/` is the output of `npm install --prefix ~/.openclaw/ve
 
 ```xml
 <string>/opt/homebrew/bin/node</string>
-<string>/Users/skadauke/.openclaw/current/lib/node_modules/openclaw/dist/index.js</string>
+<string>/Users/<username>/.openclaw/current/lib/node_modules/openclaw/dist/index.js</string>
 ```
 
 launchd resolves the symlink at exec time. Promote = swap symlink + kickstart launchd. The `OPENCLAW_SERVICE_VERSION` env var is dropped (it would lie); a `OPENCLAW_VERSION_SOURCE=symlink` marker replaces it.
@@ -176,7 +176,7 @@ Planned v2: `openclaw-update` with no args runs the full update flow interactive
 
 Failure at step 4d auto-rollback fires. Exits non-zero.
 
-### 5.3 Non-CLI update detection (Stephan's failure-mode #4)
+### 5.3 Non-CLI update detection
 
 A human or background bot could still type `npm install -g openclaw` and bypass everything. Defenses:
 
@@ -222,7 +222,7 @@ Can replace the current `openclaw_version` heartbeat check once migration has be
 
 Output:
 - `{ status: "current", current: "X", latest: "X" }` → silent
-- `{ status: "stale", current: "X", latest: "Y", days_since_notify: 31 }` → notify Stephan with `Run: openclaw-update`
+- `{ status: "stale", current: "X", latest: "Y", days_since_notify: 31 }` → notify the operator with `Run: openclaw-update`
 - Heartbeat should keep using its existing 30-day OpenClaw update notification cooldown (one nag per month, regardless of version count).
 
 Also runs (every heartbeat):
@@ -337,7 +337,7 @@ Each step is independently useful and committable.
 
 ## 11. Non-goals
 
-- Auto-updating without human confirmation. Stephan triggers every promote.
+- Auto-updating without human confirmation. The operator triggers every promote.
 - Live-patching a running gateway (no hot swap; we stop/start with ≤30s downtime).
 - Cross-machine update orchestration. This system is one-mac-mini.
 - Replacing the OS/hardware resilience work. This is the app-layer update system.

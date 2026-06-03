@@ -14,7 +14,7 @@
 set -euo pipefail
 
 OPENCLAW_DIR="$HOME/.openclaw"
-CLAWD_DIR="$HOME/clawd"
+CLAWD_DIR="${OPENCLAW_UPDATE_WORKSPACE_GIT:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FORENSICS_DIR="$SCRIPT_DIR/../forensics"
 SMOKETEST="$SCRIPT_DIR/openclaw-smoketest"
@@ -164,14 +164,14 @@ if [[ -d "$CURRENT_TARGET" && ! -d "$BROKEN_DIR" ]]; then
   log "Broken version moved to: $BROKEN_DIR"
 fi
 
-# ── Report ~/clawd git drift since the most recent pre-update tag ───────────
-if command -v git >/dev/null 2>&1 && [[ -d "$CLAWD_DIR/.git" ]]; then
+# ── Report workspace git drift since the most recent pre-update tag ─────────
+if [[ -n "$CLAWD_DIR" ]] && command -v git >/dev/null 2>&1 && [[ -d "$CLAWD_DIR/.git" ]]; then
   PRE_TAG=$(git -C "$CLAWD_DIR" tag -l 'openclaw-update-pre-*' --sort=-creatordate | head -1)
   if [[ -n "$PRE_TAG" ]]; then
     CHANGED=$(git -C "$CLAWD_DIR" diff --name-only "$PRE_TAG"...HEAD 2>/dev/null | wc -l | tr -d ' ')
     if [[ "$CHANGED" != "0" ]]; then
       echo ""
-      echo "  ~/clawd has $CHANGED file(s) changed since the pre-update tag '$PRE_TAG'."
+      echo "  $CLAWD_DIR has $CHANGED file(s) changed since the pre-update tag '$PRE_TAG'."
       echo "  Review:  git -C $CLAWD_DIR diff $PRE_TAG"
       echo "  Revert:  git -C $CLAWD_DIR reset --hard $PRE_TAG   ← destructive; review first"
       echo ""
