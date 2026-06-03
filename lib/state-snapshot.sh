@@ -17,12 +17,6 @@ else
   SHA256CMD=(shasum -a 256)
 fi
 
-if command -v sha256sum >/dev/null 2>&1; then
-  SHA256=(sha256sum)
-else
-  SHA256=(shasum -a 256)
-fi
-
 # Print whitelist entries (skipping comments and blank lines)
 _whitelist_entries() {
   [[ -f "$WHITELIST_FILE" ]] || { echo "snapshot whitelist not found: $WHITELIST_FILE" >&2; return 1; }
