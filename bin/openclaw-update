@@ -41,7 +41,9 @@ Commands:
                                  Swap ~/.openclaw/current to a staged version, restart, smoketest; auto-rollback on failure.
                                  --skip 04,11 to skip specific test ids during the post-promote smoketest.
   rollback                       Run the one-command rollback helper
-  cleanup --yes [--keep N]       Remove old staged versions; never deletes current/previous/broken
+  cleanup --yes [--keep N] [--include-broken]
+                                 Remove old staged versions; never deletes current/previous.
+                                 --include-broken also removes .broken-<timestamp>/ forensic dirs.
 
 Safety:
   migrate-to-versioned.sh performs the one-time switchover. Promote/cleanup require --yes.
@@ -49,7 +51,7 @@ Safety:
 }
 
 function parse(argv) {
-  const args = { _: [], json: false, yes: false, dryRun: false, quick: false, keep: 3, telegram: true, withModels: false, interpret: false, port: 18790, bonjourWatchSec: 120, verbose: false, skip: [], configSource: null };
+  const args = { _: [], json: false, yes: false, dryRun: false, quick: false, keep: 3, telegram: true, withModels: false, interpret: false, port: 18790, bonjourWatchSec: 120, verbose: false, skip: [], configSource: null, includeBroken: false };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--json') args.json = true;
@@ -66,6 +68,7 @@ function parse(argv) {
     else if (a === '--verbose') args.verbose = true;
     else if (a === '--interpret') args.interpret = true;
     else if (a === '--keep') args.keep = Number(argv[++i]);
+    else if (a === '--include-broken') args.includeBroken = true;
     else if (a === '-h' || a === '--help') { usage(); process.exit(0); }
     else args._.push(a);
   }
@@ -608,8 +611,13 @@ function cmdCleanup(args) {
   const current = existsSync(CURRENT_LINK) ? basename(readlink(CURRENT_LINK)) : null;
   const previous = existsSync(PREVIOUS_LINK) ? basename(readlink(PREVIOUS_LINK)) : null;
   const protectedSet = new Set([current, previous].filter(Boolean));
-  const candidates = listVersions().filter(v => !protectedSet.has(v) && !v.includes('.broken-')).sort().reverse();
-  const remove = candidates.slice(args.keep);
+  const allVersions = listVersions();
+  const cleanCandidates = allVersions.filter(v => !protectedSet.has(v) && !v.includes('.broken-')).sort().reverse();
+  const remove = cleanCandidates.slice(args.keep);
+  if (args.includeBroken) {
+    const brokenDirs = allVersions.filter(v => v.includes('.broken-'));
+    remove.push(...brokenDirs);
+  }
   if (!remove.length) { console.log('Nothing to clean.'); return; }
   for (const v of remove) {
     const p = versionDir(v);
