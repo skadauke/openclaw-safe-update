@@ -13,7 +13,7 @@ jobs:
         run: sudo apt-get install -y shellcheck
       - name: Run shellcheck
         run: |
-          shellcheck migrate-to-versioned.sh \
-                    bin/openclaw-rollback \
-                    lib/state-snapshot.sh \
-                    install.sh
+          shellcheck -x migrate-to-versioned.sh \
+                        bin/openclaw-rollback \
+                        lib/state-snapshot.sh \
+                        install.sh

@@ -25,7 +25,7 @@ LAUNCHD_LABEL="${OPENCLAW_LAUNCHD_LABEL:-ai.openclaw.gateway}"
 PLIST="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
 GW_CONTROL="$SCRIPT_DIR/../lib/gateway-control.mjs"
 
-# shellcheck source=../lib/state-snapshot.sh
+# shellcheck source=lib/state-snapshot.sh
 source "$SCRIPT_DIR/../lib/state-snapshot.sh"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -72,8 +72,8 @@ fi
 log "Bonjour guard: env=$ENV_GUARD config=$CFG_GUARD"
 
 # ── Verify versioned install is set up ─────────────────────────────────────
-[[ -L "$OPENCLAW_DIR/current" ]] || die "~/.openclaw/current is not a symlink. Has migrate-to-versioned.sh been run?"
-[[ -L "$OPENCLAW_DIR/previous" ]] || die "~/.openclaw/previous symlink missing — nothing to roll back to."
+[[ -L "$OPENCLAW_DIR/current" ]] || die "$HOME/.openclaw/current is not a symlink. Has migrate-to-versioned.sh been run?"
+[[ -L "$OPENCLAW_DIR/previous" ]] || die "$HOME/.openclaw/previous symlink missing — nothing to roll back to."
 
 CURRENT_TARGET=$(readlink -f "$OPENCLAW_DIR/current")
 PREVIOUS_TARGET=$(readlink -f "$OPENCLAW_DIR/previous")

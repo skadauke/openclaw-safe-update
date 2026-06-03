@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Shared snapshot/restore helpers for openclaw-update.
 # Source this file from bash scripts:
 #   source "$SCRIPT_DIR/../lib/state-snapshot.sh"
@@ -39,10 +40,12 @@ snapshot_state() {
 
   local manifest_tmp
   manifest_tmp=$(mktemp)
-  echo "{" > "$manifest_tmp"
-  echo "  \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"," >> "$manifest_tmp"
-  echo "  \"openclaw_dir\": \"$openclaw_dir\"," >> "$manifest_tmp"
-  echo "  \"files\": {" >> "$manifest_tmp"
+  {
+    echo "{"
+    echo "  \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\","
+    echo "  \"openclaw_dir\": \"$openclaw_dir\","
+    echo "  \"files\": {"
+  } > "$manifest_tmp"
 
   local first=1
   local entry src dest sha
@@ -60,9 +63,11 @@ snapshot_state() {
     fi
   done < <(_whitelist_entries)
 
-  echo "" >> "$manifest_tmp"
-  echo "  }" >> "$manifest_tmp"
-  echo "}" >> "$manifest_tmp"
+  {
+    echo ""
+    echo "  }"
+    echo "}"
+  } >> "$manifest_tmp"
   mv "$manifest_tmp" "$snap_dir/snapshot.json"
   echo "snapshotted state → $snap_dir"
 }
