@@ -1,0 +1,240 @@
+#!/usr/bin/env node
+// safe-state — git-backed snapshot/restore of ~/.openclaw state files.
+//
+// Uses a bare git repo at ~/clawd/clawd-resilience/openclaw-update/state-repo.git
+// with worktree set to ~/.openclaw. Excludes the huge/transient dirs
+// (versions/, browser/, memory/, logs/, ...) via state-repo.gitignore so each
+// snapshot is small and only captures real config/state churn.
+//
+// Why git: dedup keeps repeat snapshots tiny, atomic commits avoid torn writes,
+// `safe-state diff` shows exactly what doctor --fix or safe-config-edit
+// changed, and `safe-state restore <sha>` is an idempotent rollback.
+//
+// Commands:
+//   init                     create the bare repo + initial baseline commit
+//   status                   git status against current worktree
+//   snapshot <note>          commit current state as "pre-<note>-<TS>" (returns SHA)
+//   diff [<sha>]             diff worktree vs SHA (default: HEAD)
+//   show <sha>               git show <sha> --stat
+//   restore <sha>            checkout <sha> -- . (restores tracked files only)
+//   log [-n N]               git log --oneline
+//   gc                       git gc --prune=now (compact repo)
+//
+// All commands are safe to run while the gateway is up — git operations don't
+// touch the gateway. safe-config-edit and safe-doctor-fix wrap snapshot/restore
+// in their own restart+health-check logic.
+
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, statSync } from 'node:fs';
+import { resolve, dirname } from 'node:path';
+import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const RESILIENCE_DIR = resolve(HERE, '..');
+const OPENCLAW_DIR = resolve(homedir(), '.openclaw');
+const GIT_DIR = resolve(RESILIENCE_DIR, 'state-repo.git');
+const EXCLUDES_FILE = resolve(RESILIENCE_DIR, 'state-repo.gitignore');
+
+function git(args, opts = {}) {
+  const env = {
+    ...process.env,
+    GIT_DIR,
+    GIT_WORK_TREE: OPENCLAW_DIR,
+    // Pin excludes file so user ~/.gitignore_global doesn't bleed in
+    GIT_CONFIG_PARAMETERS: `'core.excludesFile=${EXCLUDES_FILE}'`,
+  };
+  const r = spawnSync('git', args, {
+    env,
+    // Always run from the worktree root so cwd-relative pathspecs
+    // (e.g. `-- .`) match the full repo, not just whatever subdir the
+    // user happened to invoke from. Without this, `git checkout <sha> -- .`
+    // silently restores nothing when invoked from ~/.openclaw/bin.
+    cwd: opts.cwd ?? OPENCLAW_DIR,
+    encoding: 'utf8',
+    timeout: opts.timeout ?? 60000,
+    stdio: opts.stdio ?? ['ignore', 'pipe', 'pipe'],
+  });
+  return r;
+}
+
+function gitOrThrow(args, opts) {
+  const r = git(args, opts);
+  if (r.status !== 0) {
+    const msg = (r.stderr || r.stdout || '').trim();
+    throw new Error(`git ${args.join(' ')} failed (exit ${r.status}): ${msg}`);
+  }
+  return r;
+}
+
+function ts() {
+  const d = new Date();
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}T${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+function ensureInit() {
+  if (!existsSync(GIT_DIR)) {
+    throw new Error(`state repo not initialized. Run: safe-state init`);
+  }
+}
+
+function cmdInit() {
+  if (existsSync(GIT_DIR)) {
+    console.log(`✓ already initialized: ${GIT_DIR}`);
+    return;
+  }
+  if (!existsSync(EXCLUDES_FILE)) {
+    throw new Error(`excludes file missing: ${EXCLUDES_FILE}`);
+  }
+  console.log(`→ init bare repo at ${GIT_DIR}`);
+  // Standard bare init, then we configure work-tree separately on each call.
+  // (Bare repos don't store core.worktree by default and we want to keep the
+  // repo portable to other hosts, so we pass --git-dir + --work-tree per call.)
+  const r = spawnSync('git', ['init', '--bare', GIT_DIR], { encoding: 'utf8', timeout: 15000 });
+  if (r.status !== 0) throw new Error(`git init failed: ${r.stderr || r.stdout}`);
+  // Set author so commits succeed without user config
+  gitOrThrow(['config', 'user.name', 'safe-state']);
+  gitOrThrow(['config', 'user.email', 'safe-state@openclaw.local']);
+  // Disable signing in case user has commit.gpgsign=true globally
+  gitOrThrow(['config', 'commit.gpgsign', 'false']);
+  // Initial baseline
+  console.log('→ initial baseline commit');
+  gitOrThrow(['add', '-A']);
+  const tree = gitOrThrow(['status', '--porcelain']);
+  if (!tree.stdout.trim()) {
+    // Empty tree case: create an empty commit so HEAD exists
+    gitOrThrow(['commit', '--allow-empty', '-m', `baseline-${ts()}`]);
+  } else {
+    gitOrThrow(['commit', '-m', `baseline-${ts()}`]);
+  }
+  const sha = gitOrThrow(['rev-parse', '--short', 'HEAD']).stdout.trim();
+  console.log(`✓ baseline: ${sha}`);
+  reportSize();
+}
+
+function reportSize() {
+  try {
+    let total = 0;
+    const r = spawnSync('du', ['-sk', GIT_DIR], { encoding: 'utf8', timeout: 10000 });
+    if (r.status === 0) total = parseInt(r.stdout.split(/\s+/)[0], 10) || 0;
+    const tracked = gitOrThrow(['ls-files']).stdout.split('\n').filter(Boolean).length;
+    console.log(`  repo: ${(total/1024).toFixed(1)} MiB, ${tracked} tracked files`);
+  } catch {}
+}
+
+function cmdStatus() {
+  ensureInit();
+  const r = gitOrThrow(['status', '--short']);
+  if (!r.stdout.trim()) {
+    console.log('clean (no changes since last snapshot)');
+  } else {
+    process.stdout.write(r.stdout);
+  }
+}
+
+function cmdSnapshot(note) {
+  ensureInit();
+  if (!note) throw new Error('snapshot requires <note>');
+  const safe = note.replace(/[^a-zA-Z0-9_-]/g, '-');
+  const msg = `pre-${safe}-${ts()}`;
+  gitOrThrow(['add', '-A']);
+  const st = gitOrThrow(['status', '--porcelain']);
+  if (!st.stdout.trim()) {
+    // Allow empty commits so callers always get a usable SHA to restore to
+    gitOrThrow(['commit', '--allow-empty', '-m', msg]);
+  } else {
+    gitOrThrow(['commit', '-m', msg]);
+  }
+  const sha = gitOrThrow(['rev-parse', 'HEAD']).stdout.trim();
+  const shortSha = sha.slice(0, 12);
+  console.log(`✓ snapshot: ${shortSha}  (${msg})`);
+  if (st.stdout.trim()) {
+    const stat = gitOrThrow(['diff', '--stat', 'HEAD~1', 'HEAD']);
+    process.stdout.write(stat.stdout);
+  }
+  return sha;
+}
+
+function cmdDiff(sha) {
+  ensureInit();
+  const target = sha || 'HEAD';
+  // Compare worktree against the given SHA. --stat first for summary.
+  const stat = gitOrThrow(['diff', '--stat', target]);
+  process.stdout.write(stat.stdout || '(no changes)\n');
+  if (stat.stdout.trim()) {
+    console.log('---');
+    const full = gitOrThrow(['diff', target]);
+    process.stdout.write(full.stdout);
+  }
+}
+
+function cmdShow(sha) {
+  ensureInit();
+  if (!sha) throw new Error('show requires <sha>');
+  const r = gitOrThrow(['show', '--stat', sha]);
+  process.stdout.write(r.stdout);
+}
+
+function cmdRestore(sha) {
+  ensureInit();
+  if (!sha) throw new Error('restore requires <sha>');
+  // Resolve to full SHA first to validate it exists
+  const resolved = gitOrThrow(['rev-parse', '--verify', sha]).stdout.trim();
+  console.log(`→ restoring tracked files to ${resolved.slice(0,12)}`);
+  // checkout <sha> -- . restores tracked paths. Files that were untracked at
+  // <sha> (e.g. orphan transcripts doctor archived) are NOT recreated; that's
+  // intentional — we only undo changes to tracked state.
+  gitOrThrow(['checkout', resolved, '--', '.']);
+  console.log('✓ restored');
+}
+
+function cmdLog(args) {
+  ensureInit();
+  const nIdx = args.indexOf('-n');
+  const n = nIdx >= 0 ? parseInt(args[nIdx + 1], 10) || 20 : 20;
+  const r = gitOrThrow(['log', `-n`, String(n), '--oneline', '--decorate']);
+  process.stdout.write(r.stdout);
+}
+
+function cmdGc() {
+  ensureInit();
+  console.log('→ git gc --prune=now');
+  const r = git(['gc', '--prune=now', '--quiet'], { timeout: 60000 });
+  if (r.status !== 0) throw new Error(`gc failed: ${r.stderr}`);
+  reportSize();
+}
+
+const usage = `safe-state — git-backed ~/.openclaw snapshots
+
+Usage:
+  safe-state init                 create bare repo + initial baseline
+  safe-state status               git status of worktree
+  safe-state snapshot <note>      commit current state, returns SHA
+  safe-state diff [<sha>]         diff worktree vs SHA (default HEAD)
+  safe-state show <sha>           show what changed in a commit
+  safe-state restore <sha>        restore tracked files to SHA
+  safe-state log [-n N]           recent snapshots
+  safe-state gc                   compact repo
+
+Repo:     ${GIT_DIR}
+Worktree: ${OPENCLAW_DIR}
+Excludes: ${EXCLUDES_FILE}`;
+
+const argv = process.argv.slice(2);
+const cmd = argv[0];
+try {
+  if (!cmd || cmd === '-h' || cmd === '--help') { console.log(usage); process.exit(0); }
+  else if (cmd === 'init') cmdInit();
+  else if (cmd === 'status') cmdStatus();
+  else if (cmd === 'snapshot') cmdSnapshot(argv[1]);
+  else if (cmd === 'diff') cmdDiff(argv[1]);
+  else if (cmd === 'show') cmdShow(argv[1]);
+  else if (cmd === 'restore') cmdRestore(argv[1]);
+  else if (cmd === 'log') cmdLog(argv.slice(1));
+  else if (cmd === 'gc') cmdGc();
+  else throw new Error(`unknown command: ${cmd}\n${usage}`);
+} catch (err) {
+  console.error(`safe-state: ${err.message}`);
+  process.exit(1);
+}

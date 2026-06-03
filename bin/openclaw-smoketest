@@ -1,0 +1,90 @@
+#!/usr/bin/env node
+// Run the openclaw smoketest suite.
+// Usage:
+//   openclaw-smoketest                        # full suite (telegram included), current install
+//   openclaw-smoketest --quick                # tests tagged 'quick' only
+//   openclaw-smoketest --json                 # JSON output
+//   openclaw-smoketest --with-models          # opt-in model/agent roundtrips
+//   openclaw-smoketest --no-telegram          # skip the Telegram roundtrip (sandbox/CI)
+//   openclaw-smoketest --skip 07,09           # skip specific test IDs
+//   openclaw-smoketest --target sandbox --port 18790 --install-dir ~/.openclaw/versions/X/lib/node_modules/openclaw
+
+import { resolve } from 'node:path';
+import { homedir } from 'node:os';
+import { dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { existsSync, lstatSync } from 'node:fs';
+import { runSmoketest, formatTextReport } from '../lib/smoketest.mjs';
+
+function defaultInstallDir() {
+  // Post-migration: use ~/.openclaw/current/lib/node_modules/openclaw or
+  // ~/.openclaw/current/node_modules/openclaw (npm-prefix layout).
+  // Pre-migration: fall back to the brew global path.
+  const currentLink = resolve(homedir(), '.openclaw/current');
+  if (existsSync(currentLink) && lstatSync(currentLink).isSymbolicLink()) {
+    const libLayout = resolve(currentLink, 'lib/node_modules/openclaw');
+    if (existsSync(libLayout)) return libLayout;
+    const npmLayout = resolve(currentLink, 'node_modules/openclaw');
+    if (existsSync(npmLayout)) return npmLayout;
+  }
+  return '/opt/homebrew/lib/node_modules/openclaw';
+}
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+
+function parseArgs(argv) {
+  const opts = {
+    target: 'current',
+    port: 18789,
+    configDir: resolve(homedir(), '.openclaw'),
+    installDir: defaultInstallDir(),
+    telegram: true,  // on by default — Telegram roundtrip is core to "is this working?"
+    models: false,
+    mode: 'full',
+    skip: [],
+    json: false,
+    verbose: false,
+  };
+  for (let i = 2; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--quick') opts.mode = 'quick';
+    else if (a === '--json') opts.json = true;
+    else if (a === '--verbose') opts.verbose = true;
+    else if (a === '--with-telegram') opts.telegram = true;   // no-op, kept for backwards compat
+    else if (a === '--no-telegram') opts.telegram = false;
+    else if (a === '--with-models') opts.models = true;
+    else if (a === '--target') opts.target = argv[++i];
+    else if (a === '--port') opts.port = parseInt(argv[++i], 10);
+    else if (a === '--install-dir') opts.installDir = argv[++i];
+    else if (a === '--config-dir') opts.configDir = argv[++i];
+    else if (a === '--skip') opts.skip = argv[++i].split(',').map(s => s.trim());
+    else if (a === '-h' || a === '--help') {
+      console.log([
+        'Usage: openclaw-smoketest [options]',
+        '  --quick              Run only quick-tagged tests',
+        '  --json               JSON output instead of text',
+        '  --verbose            Log test progress to stderr',
+        '  --with-models        Include opt-in model/agent roundtrip tests',
+        '  --no-telegram        Skip the Telegram roundtrip test',
+        '  --target <t>         current | sandbox (default: current)',
+        '  --port <n>           Gateway port (default: 18789)',
+        '  --install-dir <d>    openclaw package dir (default: brew path)',
+        '  --config-dir <d>     ~/.openclaw equivalent (default: ~/.openclaw)',
+        '  --skip <ids>         Comma-separated test IDs to skip',
+      ].join('\n'));
+      process.exit(0);
+    }
+  }
+  return opts;
+}
+
+const opts = parseArgs(process.argv);
+const report = await runSmoketest(opts);
+
+if (opts.json) {
+  console.log(JSON.stringify(report, null, 2));
+} else {
+  console.log(formatTextReport(report));
+}
+
+process.exit(report.failed > 0 ? 1 : 0);

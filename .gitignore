@@ -1,0 +1,8 @@
+# Secret-bearing runtime artifacts — never commit
+forensics/
+state-repo.git/
+*.at-rollback
+*.log.tail
+
+node_modules/
+.DS_Store

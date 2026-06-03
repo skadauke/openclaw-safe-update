@@ -1,0 +1,11 @@
+{
+  "name": "openclaw-update",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Safe openclaw update system — versioned installs, smoketest, rollback",
+  "bin": {
+    "openclaw-smoketest": "./bin/openclaw-smoketest",
+    "openclaw-rollback": "./bin/openclaw-rollback",
+    "openclaw-update": "./bin/openclaw-update"
+  }
+}

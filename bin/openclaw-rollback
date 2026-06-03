@@ -1,0 +1,242 @@
+#!/bin/bash
+# openclaw-rollback — one-command rollback to the previous openclaw version.
+# Run from Jump Desktop, Moby-Dock terminal, or any sudo shell on the Mac mini.
+# No arguments required.
+#
+# What it does:
+#   1. Reads ~/.openclaw/previous symlink to find the rollback target version.
+#   2. Persists forensics from the current version to clawd-resilience/openclaw-update/forensics/.
+#   3. Atomically swaps current → previous.
+#   4. Renames broken version dir to <version>.broken-<timestamp>/ for forensics.
+#   5. Restarts the launchd gateway service.
+#   6. Runs a quick smoketest to confirm recovery.
+
+set -euo pipefail
+
+OPENCLAW_DIR="$HOME/.openclaw"
+CLAWD_DIR="$HOME/clawd"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FORENSICS_DIR="$SCRIPT_DIR/../forensics"
+SMOKETEST="$SCRIPT_DIR/openclaw-smoketest"
+NODE=/opt/homebrew/bin/node
+TS=$(date +%Y%m%dT%H%M%S)
+LAUNCHD_LABEL="ai.openclaw.gateway"
+PLIST="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
+
+# shellcheck source=../lib/state-snapshot.sh
+source "$SCRIPT_DIR/../lib/state-snapshot.sh"
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+log() { echo "[openclaw-rollback] $*"; }
+
+wait_port_free() {
+  local port="$1"
+  local max="${2:-30}"
+  local i=0
+  while [[ $i -lt $max ]]; do
+    if ! lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then return 0; fi
+    sleep 1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+wait_healthz() {
+  local port="${1:-18789}"
+  local max="${2:-40}"
+  local i=0
+  while [[ $i -lt $max ]]; do
+    if curl -sf --max-time 1 "http://127.0.0.1:$port/healthz" 2>/dev/null | grep -q '"ok":true'; then
+      echo "$i"
+      return 0
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# ── Bonjour-disabled pre-flight ─────────────────────────────────────────────
+# The rolled-back version inherits whatever Bonjour guards are in place. Without
+# at least one, the gateway can crash-loop on macOS, leaving us stuck.
+ENV_GUARD=0; CFG_GUARD=0
+if [[ -f "$PLIST" ]] && grep -q "OPENCLAW_DISABLE_BONJOUR" "$PLIST" && \
+   grep -A1 "OPENCLAW_DISABLE_BONJOUR" "$PLIST" | grep -q "<string>1</string>"; then
+  ENV_GUARD=1
+fi
+if [[ -f "$OPENCLAW_DIR/openclaw.json" ]]; then
+  CFG_GUARD=$(python3 -c "
+import json
+try:
+  c = json.load(open('$OPENCLAW_DIR/openclaw.json'))
+  print(1 if c.get('discovery',{}).get('mdns',{}).get('mode') == 'off' else 0)
+except Exception:
+  print(0)
+" 2>/dev/null || echo 0)
+fi
+if [[ "$ENV_GUARD" != "1" && "$CFG_GUARD" != "1" ]]; then
+  echo ""
+  echo "WARNING: Bonjour is not disabled. Rolled-back gateway may crash-loop."
+  echo "  To fix BEFORE rollback: set discovery.mdns.mode=off in openclaw.json"
+  echo "  or OPENCLAW_DISABLE_BONJOUR=1 in $PLIST."
+  echo ""
+  read -rp "Continue anyway? [yes/no]: " CONFIRM
+  [[ "$CONFIRM" == "yes" ]] || die "Aborted by user."
+fi
+log "Bonjour guard: env=$ENV_GUARD config=$CFG_GUARD"
+
+# ── Verify versioned install is set up ─────────────────────────────────────
+[[ -L "$OPENCLAW_DIR/current" ]] || die "~/.openclaw/current is not a symlink. Has migrate-to-versioned.sh been run?"
+[[ -L "$OPENCLAW_DIR/previous" ]] || die "~/.openclaw/previous symlink missing — nothing to roll back to."
+
+CURRENT_TARGET=$(readlink -f "$OPENCLAW_DIR/current")
+PREVIOUS_TARGET=$(readlink -f "$OPENCLAW_DIR/previous")
+
+[[ "$CURRENT_TARGET" != "$PREVIOUS_TARGET" ]] || die "current and previous point to the same version ($CURRENT_TARGET). Nothing to roll back."
+
+CURRENT_VER=$(basename "$CURRENT_TARGET")
+PREV_VER=$(basename "$PREVIOUS_TARGET")
+
+log "Rolling back: $CURRENT_VER → $PREV_VER"
+log "Forensics will be saved to: $FORENSICS_DIR/$TS-$CURRENT_VER/"
+
+# ── Collect forensics from the version being abandoned ─────────────────────
+mkdir -p "$FORENSICS_DIR/$TS-$CURRENT_VER"
+FD="$FORENSICS_DIR/$TS-$CURRENT_VER"
+
+# Gateway logs (last 500 lines each)
+tail -500 "$OPENCLAW_DIR/logs/gateway.log" 2>/dev/null > "$FD/gateway.log.tail" || true
+tail -500 "$OPENCLAW_DIR/logs/gateway.err.log" 2>/dev/null > "$FD/gateway.err.log.tail" || true
+
+# Config snapshot
+cp "$OPENCLAW_DIR/openclaw.json" "$FD/openclaw.json.at-rollback" 2>/dev/null || true
+
+# Plist snapshot
+cp "$PLIST" "$FD/gateway.plist.at-rollback" 2>/dev/null || true
+
+# Manifest entry
+cat > "$FD/manifest.json" <<EOF
+{
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "event": "rollback",
+  "rolled_back_from": "$CURRENT_VER",
+  "rolled_back_to": "$PREV_VER",
+  "triggered_by": "$(whoami)",
+  "reason": "manual"
+}
+EOF
+log "Forensics saved."
+
+# ── Stop the gateway ────────────────────────────────────────────────────────
+log "Stopping gateway..."
+launchctl bootout "gui/$(id -u)/$LAUNCHD_LABEL" 2>/dev/null || launchctl unload "$PLIST" 2>/dev/null || true
+if ! wait_port_free 18789 15; then
+  log "  Port 18789 still held after 15s; force-killing remaining listener(s)..."
+  for pid in $(lsof -nP -iTCP:18789 -sTCP:LISTEN -t 2>/dev/null); do
+    kill -9 "$pid" 2>/dev/null || true
+  done
+  sleep 2
+fi
+
+# ── Restore ~/.openclaw config snapshot bound to the rollback target ───────
+log "Checking for state snapshot for $PREV_VER..."
+SNAPSHOT_DIR="$PREVIOUS_TARGET/.state-snapshot"
+if [[ -f "$SNAPSHOT_DIR/snapshot.json" ]]; then
+  log "Snapshot found — restoring config files openclaw $PREV_VER expects."
+  if restore_state "$PREVIOUS_TARGET" "$OPENCLAW_DIR"; then
+    log "Config restored."
+  else
+    echo "WARNING: state restore failed or partial. Continuing with symlink-only rollback." >&2
+  fi
+else
+  echo "WARNING: no state snapshot for $PREV_VER. If the rolled-back-from version migrated openclaw.json," >&2
+  echo "         the old version may not boot. Manual recovery from ${OPENCLAW_DIR}/openclaw.json.bak.* may be required." >&2
+fi
+
+# ── Swap symlinks ───────────────────────────────────────────────────────────
+log "Swapping current → $PREV_VER"
+ln -sfn "$(readlink "$OPENCLAW_DIR/previous")" "$OPENCLAW_DIR/current"
+
+# Tag the broken version dir for forensics (don't delete it)
+BROKEN_DIR="${CURRENT_TARGET}.broken-${TS}"
+if [[ -d "$CURRENT_TARGET" && ! -d "$BROKEN_DIR" ]]; then
+  mv "$CURRENT_TARGET" "$BROKEN_DIR"
+  log "Broken version moved to: $BROKEN_DIR"
+fi
+
+# ── Report ~/clawd git drift since the most recent pre-update tag ───────────
+if command -v git >/dev/null 2>&1 && [[ -d "$CLAWD_DIR/.git" ]]; then
+  PRE_TAG=$(git -C "$CLAWD_DIR" tag -l 'openclaw-update-pre-*' --sort=-creatordate | head -1)
+  if [[ -n "$PRE_TAG" ]]; then
+    CHANGED=$(git -C "$CLAWD_DIR" diff --name-only "$PRE_TAG"...HEAD 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$CHANGED" != "0" ]]; then
+      echo ""
+      echo "  ~/clawd has $CHANGED file(s) changed since the pre-update tag '$PRE_TAG'."
+      echo "  Review:  git -C $CLAWD_DIR diff $PRE_TAG"
+      echo "  Revert:  git -C $CLAWD_DIR reset --hard $PRE_TAG   ← destructive; review first"
+      echo ""
+    fi
+  fi
+fi
+
+# ── Restart the gateway ─────────────────────────────────────────────────────
+log "Starting gateway..."
+if ! launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/tmp/launchctl-rollback-bootstrap.err; then
+  log "  launchctl bootstrap failed: $(cat /tmp/launchctl-rollback-bootstrap.err)"
+  log "  Trying legacy launchctl load..."
+  if ! launchctl load "$PLIST" 2>/dev/null; then
+    echo ""
+    echo "═══════════════════════════════════════════════════════════"
+    echo "  CRITICAL: Rollback failed to start gateway."
+    echo "  Gateway is NOT running. Manual recovery:"
+    echo "    launchctl bootout gui/\$(id -u)/$LAUNCHD_LABEL 2>/dev/null"
+    echo "    sleep 5"
+    echo "    launchctl bootstrap gui/\$(id -u) $PLIST"
+    echo "═══════════════════════════════════════════════════════════"
+    exit 2
+  fi
+fi
+
+# Wait for gateway to actually respond before declaring success.
+log "  Waiting for /healthz to come up..."
+if SECS=$(wait_healthz 18789 40); then
+  log "  ✓ Gateway healthy after ${SECS}s."
+else
+  echo ""
+  echo "═══════════════════════════════════════════════════════════"
+  echo "  CRITICAL: Rollback bootstrap reported success but gateway"
+  echo "  is not responding on /healthz after 40s."
+  echo ""
+  echo "  Check: tail $OPENCLAW_DIR/logs/gateway.log"
+  echo "         tail $OPENCLAW_DIR/logs/gateway.err.log"
+  echo "  Forensics: $FD"
+  echo "═══════════════════════════════════════════════════════════"
+  exit 2
+fi
+
+# ── Quick smoketest ─────────────────────────────────────────────────────────
+log "Running quick smoketest..."
+if [[ -x "$SMOKETEST" ]]; then
+  if "$NODE" "$SMOKETEST" --quick 2>&1; then
+    log "Rollback successful. Gateway is healthy on $PREV_VER."
+  else
+    echo "WARNING: Quick smoketest failed after rollback — but gateway is responding on /healthz." >&2
+    echo "  Some tests may be flaky; verify manually." >&2
+    echo "  gateway log: $OPENCLAW_DIR/logs/gateway.log" >&2
+    echo "  forensics: $FD" >&2
+    exit 1
+  fi
+else
+  log "Smoketest not found — verify the gateway manually."
+fi
+
+# ── Done ────────────────────────────────────────────────────────────────────
+echo ""
+echo "  Rolled back to: $PREV_VER"
+echo "  Broken version: ${BROKEN_DIR:-$CURRENT_TARGET} (kept for forensics)"
+echo "  Forensics:      $FD"
+echo ""
+echo "Next steps:"
+echo "  • Review forensics at: $FD"
+echo "  • Check gateway log:   $OPENCLAW_DIR/logs/gateway.log"
+echo "  • If all is well, keep running on $PREV_VER until a fixed version ships"

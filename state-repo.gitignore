@@ -1,0 +1,44 @@
+# Excludes for the ~/.openclaw state repo. Lives in clawd so it's version-
+# controlled with the rest of the resilience tooling, pointed at via
+# core.excludesFile.
+
+# Huge or fast-churning directories
+versions/
+browser/
+memory/
+logs/
+cache/
+media/
+plugin-runtime-deps/
+npm/
+tasks/
+flows/
+completions/
+.doctor-fix-snapshots/
+session-delivery-queue/
+delivery-queue/
+workspace/
+
+# Backups and temp files
+*.lock
+*.tmp
+*.bak
+*.bak.*
+*.bak-*
+*.pre-*
+*.clobbered.*
+*~
+
+# Transient runtime state
+gateway-supervisor-restart-handoff.json
+exec-approvals.json
+update-check.json*
+
+# Session transcripts — large, change every turn
+**/sessions/*.jsonl
+**/sessions/*.jsonl.lock
+**/sessions/*.deleted.*
+
+# Reproducible from versions/
+current
+previous

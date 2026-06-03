@@ -1,0 +1,396 @@
+#!/usr/bin/env node
+// safe-doctor-fix — wrap `openclaw doctor --repair` with full-tree snapshot
+// and auto-rollback on health failure.
+//
+// What doctor --fix can touch (broader than safe-config-edit):
+//   - ~/.openclaw/openclaw.json                   (model refs, plugin entries)
+//   - ~/.openclaw/agents/*/agent/auth-profiles.json (shadow cleanup)
+//   - ~/.openclaw/agents/*/sessions/sessions.json (model pins, skill paths)
+//   - ~/.openclaw/agents/*/sessions/*.jsonl        (orphan archive, snapshot paths)
+//   - ~/.openclaw/cron/jobs.json                   (legacy model refs)
+//   - ~/.openclaw/browser/                         (archive legacy profile)
+//
+// Strategy:
+//   1. Pre-check: gateway healthy now? If not, abort — don't make things worse.
+//   2. Snapshot the touched tree to ~/.openclaw/.doctor-fix-snapshots/<TS>.tar.gz
+//   3. Run `openclaw doctor --repair --non-interactive --yes`
+//      (--non-interactive skips aggressive service-config rewrites + OAuth re-auth)
+//   4. Tee output to a transcript log file.
+//   5. Kickstart gateway, then fast-fail health check (reuses err.log scan).
+//   6. On failure: extract snapshot tar, kickstart, verify. Notify Telegram.
+//
+// Flags:
+//   --dry-run     run doctor without --repair (just shows what would change)
+//   --rollback    extract the most recent snapshot tar and kickstart
+//   --no-restart  apply repairs but don't restart/health-check (advanced)
+//   --note <s>    label for snapshot + transcript filenames
+
+import { spawnSync, spawn } from 'node:child_process';
+import { existsSync, mkdirSync, readdirSync, statSync, readFileSync, openSync, readSync, closeSync, createWriteStream } from 'node:fs';
+import { resolve, basename, dirname } from 'node:path';
+import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const SAFE_STATE = resolve(HERE, 'safe-state');
+const OPENCLAW_DIR = resolve(homedir(), '.openclaw');
+const TRANSCRIPT_DIR = resolve(OPENCLAW_DIR, 'logs/doctor-fix');
+
+// ─── safe-state delegation ─────────────────────────────────────────────────
+// Snapshot/restore is fully delegated to safe-state (git-backed). The old
+// tar-based SNAPSHOT_DIR + SNAPSHOT_GLOBS approach is gone — safe-state
+// captures the whole ~/.openclaw tree (minus excludes), so we don't need to
+// guess which paths doctor will touch.
+
+function safeState(args, opts = {}) {
+  const r = spawnSync('node', [SAFE_STATE, ...args], {
+    encoding: 'utf8',
+    timeout: opts.timeout ?? 60000,
+    stdio: opts.stdio ?? ['ignore', 'pipe', 'pipe'],
+  });
+  return r;
+}
+
+function safeStateOrThrow(args, opts) {
+  const r = safeState(args, opts);
+  if (r.status !== 0) {
+    throw new Error(`safe-state ${args.join(' ')} failed: ${(r.stderr || r.stdout || '').trim()}`);
+  }
+  return r;
+}
+
+function ensureSafeStateInit() {
+  const gitDir = resolve(HERE, '..', 'state-repo.git');
+  if (!existsSync(gitDir)) {
+    console.log('  → safe-state not initialized; running init…');
+    safeStateOrThrow(['init']);
+  }
+}
+
+function snapshotState(note) {
+  ensureSafeStateInit();
+  const r = safeStateOrThrow(['snapshot', `doctor-${note}`]);
+  const m = r.stdout.match(/snapshot:\s+([0-9a-f]{7,40})/);
+  if (!m) throw new Error(`couldn't parse snapshot sha:\n${r.stdout}`);
+  return m[1];
+}
+
+function restoreState(sha) {
+  safeStateOrThrow(['restore', sha]);
+}
+
+function latestSnapshotSha() {
+  const r = safeStateOrThrow(['log', '-n', '1']);
+  const m = r.stdout.trim().match(/^([0-9a-f]{7,40})/);
+  return m ? m[1] : null;
+}
+// 5.28: gateway.err.log is mostly dead; real errors go to gateway-structured.log
+// (JSON). Scan both — regex matches against raw JSON text because the message
+// is in the "message" field as a substring.
+const ERR_LOGS = [
+  resolve(OPENCLAW_DIR, 'logs/gateway-structured.log'),
+  resolve(OPENCLAW_DIR, 'logs/gateway.err.log'),
+];
+const GATEWAY_LABEL = 'ai.openclaw.gateway';
+const GATEWAY_PLIST = resolve(homedir(), `Library/LaunchAgents/${GATEWAY_LABEL}.plist`);
+const PORT = 18789;
+const DM_CHAT_ID = 8290418965;
+const ALERT_BUS_TG = resolve(homedir(), 'clawd/moby-os/intelligence/alert-bus/lib/telegram-post.mjs');
+
+const FATAL_PATTERNS = [
+  /Gateway failed to start/i,
+  /Invalid config/i,
+  /Cannot find module/i,
+  /EADDRINUSE/i,
+  /Uncaught (Exception|Error)/i,
+  /panic:/i,
+  /SyntaxError/i,
+];
+const FATAL_REPEAT_THRESHOLD = 2;
+
+async function notify(text) {
+  try {
+    const { sendMessage } = await import(ALERT_BUS_TG);
+    const r = await sendMessage({ chat_id: DM_CHAT_ID, thread_id: null, text });
+    if (r.ok) console.log(`  → telegram: posted (message_id=${r.message_id})`);
+    else console.log(`  → telegram: failed (${r.reason})`);
+  } catch (err) {
+    console.log(`  → telegram: skipped (${err.message})`);
+  }
+}
+
+function parse(argv) {
+  const args = { rollback: false, dryRun: false, restart: true, note: 'fix' };
+  for (let i = 2; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--rollback') args.rollback = true;
+    else if (a === '--dry-run') args.dryRun = true;
+    else if (a === '--no-restart') args.restart = false;
+    else if (a === '--note') args.note = (argv[++i] || 'fix').replace(/[^a-zA-Z0-9_-]/g, '-');
+    else if (a === '-h' || a === '--help') { console.log(usage); process.exit(0); }
+    else throw new Error(`unknown arg: ${a}`);
+  }
+  return args;
+}
+
+const usage = `Usage:
+  safe-doctor-fix [--dry-run] [--note <label>]    # snapshot + run doctor --repair
+  safe-doctor-fix --rollback                       # restore most recent snapshot
+  safe-doctor-fix --no-restart                     # apply changes, skip health check`;
+
+function ts() {
+  const d = new Date();
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}T${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+function ensureDirs() {
+  mkdirSync(TRANSCRIPT_DIR, { recursive: true });
+}
+
+function kickstart() {
+  const uid = process.getuid();
+  spawnSync('launchctl', ['kickstart', '-k', `gui/${uid}/${GATEWAY_LABEL}`], { encoding: 'utf8', timeout: 15000 });
+}
+
+function errLogBaseline() {
+  const sizes = {};
+  for (const path of ERR_LOGS) {
+    try { sizes[path] = statSync(path).size; } catch { sizes[path] = 0; }
+  }
+  return sizes;
+}
+
+function readErrLogSince(baseline) {
+  let out = '';
+  for (const path of ERR_LOGS) {
+    try {
+      const sz = statSync(path).size;
+      const start = baseline[path] ?? 0;
+      if (sz <= start) continue;
+      const len = sz - start;
+      const fd = openSync(path, 'r');
+      try {
+        const buf = Buffer.alloc(len);
+        readSync(fd, buf, 0, len, start);
+        out += buf.toString('utf8');
+      } finally { closeSync(fd); }
+    } catch { /* skip on error */ }
+  }
+  return out;
+}
+
+function detectFatal(newText) {
+  if (!newText) return null;
+  const lines = newText.split('\n').filter(Boolean);
+  const fatal = [];
+  for (const line of lines) {
+    for (const pat of FATAL_PATTERNS) {
+      if (pat.test(line)) { fatal.push(line.slice(0, 240)); break; }
+    }
+  }
+  if (fatal.length < FATAL_REPEAT_THRESHOLD) return null;
+  const uniq = [...new Set(fatal)];
+  return { count: fatal.length, sample: uniq[uniq.length - 1] };
+}
+
+async function waitHealthy(maxSec = 60, errBaseline = null) {
+  // errBaseline MUST be captured BEFORE kickstart by the caller. 5.28's
+  // launchd throttles retries — fatal lines written immediately by the new
+  // process would be missed if baseline is captured after kickstart.
+  const url = `http://127.0.0.1:${PORT}/healthz`;
+  const start = Date.now();
+  const deadline = start + maxSec * 1000;
+  if (!errBaseline) errBaseline = errLogBaseline();
+  let lastErr = '';
+  while (Date.now() < deadline) {
+    const fatal = detectFatal(readErrLogSince(errBaseline));
+    if (fatal) {
+      const elapsed = Math.round((Date.now() - start) / 1000);
+      return { ok: false, lastErr: fatal.sample, fastFail: true, fatalCount: fatal.count, elapsed };
+    }
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(2000) });
+      if (r.ok) {
+        const body = await r.json().catch(() => ({}));
+        if (body.ok) return { ok: true, elapsed: Math.round((Date.now() - start) / 1000) };
+      }
+      lastErr = `HTTP ${r.status}`;
+    } catch (err) {
+      lastErr = err.message;
+    }
+    await new Promise(r => setTimeout(r, 1500));
+  }
+  return { ok: false, lastErr };
+}
+
+async function preCheckHealthy() {
+  try {
+    const r = await fetch(`http://127.0.0.1:${PORT}/healthz`, { signal: AbortSignal.timeout(3000) });
+    if (!r.ok) return false;
+    const body = await r.json().catch(() => ({}));
+    return !!body.ok;
+  } catch { return false; }
+}
+
+function runDoctor(args, transcriptPath) {
+  // --repair: apply recommended fixes
+  // --non-interactive: skip aggressive (service config rewrites, OAuth login)
+  // --yes: accept defaults
+  // (Doctor's safe-migration set: model ref rewrites, stale auth profile, orphan archive,
+  //  cron legacy refs, skill disabling.)
+  const flags = args.dryRun
+    ? ['doctor', '--lint', '--json', '--severity-min', 'info']
+    : ['doctor', '--repair', '--non-interactive', '--yes'];
+  console.log(`→ openclaw ${flags.join(' ')}`);
+  console.log(`  transcript: ${transcriptPath}`);
+  const out = createWriteStream(transcriptPath, { flags: 'a' });
+  out.write(`# safe-doctor-fix ${new Date().toISOString()}\n# argv: ${JSON.stringify(flags)}\n\n`);
+  // Hard-kill if doctor wedges; for non-interactive use this should never trigger.
+  const HARD_TIMEOUT_MS = args.dryRun ? 30000 : 300000;
+  const child = spawn('openclaw', flags, { stdio: ['ignore', 'pipe', 'pipe'] });
+  let jsonBuf = '';
+  child.stdout.on('data', c => { if (args.dryRun) jsonBuf += c.toString(); else process.stdout.write(c); out.write(c); });
+  child.stderr.on('data', c => { process.stderr.write(c); out.write(c); });
+  const killer = setTimeout(() => {
+    process.stderr.write(`\n[safe-doctor-fix] doctor wedged after ${HARD_TIMEOUT_MS/1000}s; killing\n`);
+    child.kill('SIGKILL');
+  }, HARD_TIMEOUT_MS);
+  return new Promise((resolve) => {
+    child.on('close', (code) => {
+      clearTimeout(killer);
+      out.write(`\n# exit ${code}\n`);
+      out.end();
+      if (args.dryRun) summarizeLint(jsonBuf);
+      resolve(code ?? 1);
+    });
+  });
+}
+
+function summarizeLint(buf) {
+  // doctor --lint --json sometimes prints log lines before the JSON. Find the
+  // first '{' or '[' and parse from there.
+  const start = buf.search(/[\{\[]/);
+  if (start < 0) { console.log('(no JSON in lint output)'); return; }
+  let data;
+  try { data = JSON.parse(buf.slice(start)); } catch (e) {
+    console.log(`(could not parse lint JSON: ${e.message})`);
+    return;
+  }
+  const findings = Array.isArray(data?.findings) ? data.findings : [];
+  if (!findings.length) { console.log('Doctor lint: no findings. ✨'); return; }
+  const bySev = {};
+  const byCheck = {};
+  for (const f of findings) {
+    bySev[f.severity] = (bySev[f.severity] || 0) + 1;
+    byCheck[f.checkId] = (byCheck[f.checkId] || 0) + 1;
+  }
+  console.log(`\nDoctor lint: ${findings.length} finding(s)`);
+  console.log(`  by severity: ${Object.entries(bySev).map(([s,n]) => `${s}=${n}`).join(', ')}`);
+  console.log(`  by check:`);
+  for (const [k, n] of Object.entries(byCheck).sort((a,b) => b[1]-a[1])) {
+    console.log(`    ${n.toString().padStart(3)} ${k}`);
+  }
+  console.log(`\nFirst 10 findings:`);
+  for (const f of findings.slice(0, 10)) {
+    const path = f.path ? ` [${f.path}]` : '';
+    console.log(`  - [${f.severity}] ${f.checkId}${path}`);
+    console.log(`      ${f.message}`);
+  }
+  if (findings.length > 10) console.log(`  ...and ${findings.length - 10} more (full JSON in transcript)`);
+}
+
+async function doFix(args) {
+  ensureDirs();
+
+  if (args.restart && !args.dryRun) {
+    console.log('→ pre-check: gateway healthy now?');
+    const ok = await preCheckHealthy();
+    if (!ok) {
+      throw new Error('gateway is NOT currently healthy; refusing to run doctor --fix on a sick host. Fix underlying issue or `safe-config-edit --rollback` first.');
+    }
+    console.log('  ✓ healthy');
+  }
+
+  const snapshotSha = args.dryRun ? null : snapshotState(args.note);
+  if (snapshotSha) console.log(`✓ state snapshot: ${snapshotSha.slice(0, 12)}`);
+
+  const transcriptPath = resolve(TRANSCRIPT_DIR, `${ts()}-${args.note}.log`);
+  const code = await runDoctor(args, transcriptPath);
+
+  if (args.dryRun) {
+    console.log(`(dry-run; doctor exit ${code}; no restart/health-check)`);
+    return;
+  }
+  if (code !== 0) {
+    console.error(`✗ openclaw doctor exited ${code}; rolling back to ${snapshotSha.slice(0, 12)}…`);
+    restoreState(snapshotSha);
+    if (args.restart) kickstart();
+    await notify(`⚠️ safe-doctor-fix "${args.note}" FAILED: doctor exit ${code}; restored snapshot ${snapshotSha.slice(0, 12)}`);
+    process.exit(1);
+  }
+
+  if (!args.restart) {
+    console.log('--no-restart: doctor done. Skipping health check.');
+    return;
+  }
+
+  console.log('→ kickstart gateway…');
+  const errBaseline1 = errLogBaseline();
+  kickstart();
+  console.log('→ waiting for /healthz…');
+  const h = await waitHealthy(60, errBaseline1);
+  if (h.ok) {
+    console.log(`✓ gateway healthy in ${h.elapsed}s`);
+    await notify(`✅ safe-doctor-fix "${args.note}" applied; gateway healthy in ${h.elapsed}s. Snapshot: ${snapshotSha.slice(0, 12)}. Revert: safe-doctor-fix --rollback`);
+    console.log(`To revert: safe-doctor-fix --rollback`);
+    return;
+  }
+
+  if (h.fastFail) {
+    console.error(`✗ fast-fail: gateway crash-looping after ${h.elapsed}s (×${h.fatalCount} fatal log lines)`);
+    console.error(`  ${h.lastErr}`);
+    console.error(`→ rolling back to ${snapshotSha.slice(0, 12)}…`);
+  } else {
+    console.error(`✗ gateway unhealthy after 60s (${h.lastErr}); rolling back to ${snapshotSha.slice(0, 12)}…`);
+  }
+  restoreState(snapshotSha);
+  const errBaseline2 = errLogBaseline();
+  kickstart();
+  const h2 = await waitHealthy(60, errBaseline2);
+  if (h2.ok) {
+    console.error(`✓ rolled back; gateway healthy in ${h2.elapsed}s`);
+    const reason = h.fastFail ? `fast-fail after ${h.elapsed}s: ${h.lastErr}` : h.lastErr;
+    await notify(`⚠️ safe-doctor-fix "${args.note}" FAILED (${reason}); auto-rolled back, gateway healthy in ${h2.elapsed}s. Snapshot retained: ${snapshotSha.slice(0, 12)}`);
+    process.exit(1);
+  }
+  console.error(`✗✗ ROLLBACK ALSO UNHEALTHY (${h2.lastErr}). Manual intervention required.`);
+  console.error(`Snapshot: ${snapshotSha}`);
+  console.error(`Manual restore: ${SAFE_STATE} restore ${snapshotSha}`);
+  await notify(`🚨 safe-doctor-fix "${args.note}" CRITICAL: rollback also unhealthy (${h2.lastErr}). Snapshot: ${snapshotSha.slice(0, 12)}. Manual intervention needed.`);
+  process.exit(2);
+}
+
+async function doRollback() {
+  ensureDirs();
+  ensureSafeStateInit();
+  const sha = latestSnapshotSha();
+  if (!sha) throw new Error('no safe-state snapshots found; nothing to roll back to');
+  console.log(`→ restoring state snapshot ${sha.slice(0, 12)}`);
+  restoreState(sha);
+  const errBaseline = errLogBaseline();
+  kickstart();
+  const h = await waitHealthy(60, errBaseline);
+  if (h.ok) {
+    console.log(`✓ gateway healthy in ${h.elapsed}s`);
+    await notify(`✅ safe-doctor-fix rolled back to ${sha.slice(0, 12)}; gateway healthy in ${h.elapsed}s`);
+  } else {
+    console.error(`✗ unhealthy after rollback (${h.lastErr})`);
+    await notify(`⚠️ safe-doctor-fix rollback to ${sha.slice(0, 12)} unhealthy (${h.lastErr}). Manual intervention needed.`);
+    process.exit(1);
+  }
+}
+
+const args = parse(process.argv);
+if (args.rollback) await doRollback();
+else await doFix(args);

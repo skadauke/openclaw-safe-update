@@ -1,0 +1,639 @@
+#!/usr/bin/env node
+// openclaw-update — safe OpenClaw update manager.
+// Safe-by-default: read-only commands do not mutate; mutating commands require
+// an explicit subcommand and, for promote/cleanup, --yes unless --dry-run.
+
+import { spawnSync, spawn } from 'node:child_process';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, rmSync, lstatSync, renameSync, cpSync, symlinkSync, mkdtempSync, unlinkSync, createWriteStream, appendFileSync } from 'node:fs';
+import { resolve, dirname, basename } from 'node:path';
+import { homedir, tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
+import { runSmoketest, formatTextReport } from '../lib/smoketest.mjs';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const ROOT = resolve(HERE, '..');
+const OPENCLAW_DIR = resolve(homedir(), '.openclaw');
+const VERSIONS_DIR = resolve(OPENCLAW_DIR, 'versions');
+const CURRENT_LINK = resolve(OPENCLAW_DIR, 'current');
+const PREVIOUS_LINK = resolve(OPENCLAW_DIR, 'previous');
+const MANIFEST = resolve(OPENCLAW_DIR, 'versions-manifest.json');
+const NODE = '/opt/homebrew/bin/node';
+const NPM = '/opt/homebrew/bin/npm';
+const BREW_INSTALL = '/opt/homebrew/lib/node_modules/openclaw';
+const GATEWAY_LABEL = 'ai.openclaw.gateway';
+const GATEWAY_PLIST = resolve(homedir(), `Library/LaunchAgents/${GATEWAY_LABEL}.plist`);
+const CLAWD_DIR = resolve(homedir(), 'clawd');
+const SNAPSHOT_HELPER = resolve(ROOT, 'lib/state-snapshot.sh');
+
+function usage() {
+  console.log(`Usage: openclaw-update <command> [options]
+
+Commands:
+  check [--json]                 Compare current version with npm latest
+  status [--json]                Show current/previous/staged versions and drift
+  stage <version|latest>         npm install --prefix ~/.openclaw/versions/<v> openclaw@<v>
+  sandbox-test <version|latest> [--config-source <path>]
+                                 Boot staged version on an alternate port/config and smoketest it.
+                                 --config-source <path>: dry-run a proposed openclaw.json edit before applying to live.
+  smoketest [--quick] [--json] [--with-models] [--no-telegram]
+                                 Run live smoketest against current gateway
+  promote <version> --yes [--skip <ids>]
+                                 Swap ~/.openclaw/current to a staged version, restart, smoketest; auto-rollback on failure.
+                                 --skip 04,11 to skip specific test ids during the post-promote smoketest.
+  rollback                       Run the one-command rollback helper
+  cleanup --yes [--keep N]       Remove old staged versions; never deletes current/previous/broken
+
+Safety:
+  migrate-to-versioned.sh performs the one-time switchover. Promote/cleanup require --yes.
+  This CLI never changes ~/.openclaw state for check/status/smoketest.`);
+}
+
+function parse(argv) {
+  const args = { _: [], json: false, yes: false, dryRun: false, quick: false, keep: 3, telegram: true, withModels: false, interpret: false, port: 18790, bonjourWatchSec: 120, verbose: false, skip: [], configSource: null };
+  for (let i = 2; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--json') args.json = true;
+    else if (a === '--yes' || a === '-y') args.yes = true;
+    else if (a === '--dry-run') args.dryRun = true;
+    else if (a === '--quick') args.quick = true;
+    else if (a === '--with-telegram') args.telegram = true; // no-op/backwards compat; Telegram is on by default
+    else if (a === '--no-telegram') args.telegram = false;
+    else if (a === '--with-models') args.withModels = true;
+    else if (a === '--port') args.port = Number(argv[++i]);
+    else if (a === '--bonjour-watch-sec') args.bonjourWatchSec = Number(argv[++i]);
+    else if (a === '--config-source') args.configSource = argv[++i];
+    else if (a === '--skip') args.skip = argv[++i].split(',').map(s => s.trim()).filter(Boolean);
+    else if (a === '--verbose') args.verbose = true;
+    else if (a === '--interpret') args.interpret = true;
+    else if (a === '--keep') args.keep = Number(argv[++i]);
+    else if (a === '-h' || a === '--help') { usage(); process.exit(0); }
+    else args._.push(a);
+  }
+  return args;
+}
+
+function run(cmd, argv, opts = {}) {
+  const r = spawnSync(cmd, argv, { encoding: 'utf8', stdio: opts.stdio ?? 'pipe', timeout: opts.timeout ?? 120000, env: opts.env ?? process.env });
+  if (r.error) throw new Error(`${cmd}: ${r.error.message}`);
+  return r;
+}
+
+function versionFromOutput(s) {
+  return (s || '').match(/(\d{4}\.\d+\.\d+)/)?.[1] ?? null;
+}
+
+function readlink(path) {
+  const r = run('readlink', ['-f', path]);
+  return r.status === 0 ? r.stdout.trim() : null;
+}
+
+function currentVersion() {
+  if (existsSync(CURRENT_LINK) && lstatSync(CURRENT_LINK).isSymbolicLink()) {
+    const target = readlink(CURRENT_LINK);
+    const pkg = target && resolve(target, 'lib/node_modules/openclaw/package.json');
+    if (pkg && existsSync(pkg)) return JSON.parse(readFileSync(pkg, 'utf8')).version;
+    return target ? basename(target).replace(/\.broken-.*/, '') : null;
+  }
+  const entry = resolve(BREW_INSTALL, 'openclaw.mjs');
+  if (existsSync(entry)) {
+    const r = run(NODE, [entry, '--version'], { timeout: 10000 });
+    return versionFromOutput(r.stdout || r.stderr);
+  }
+  const r = run('openclaw', ['--version'], { timeout: 10000 });
+  return versionFromOutput(r.stdout || r.stderr);
+}
+
+function latestVersion() {
+  const r = run(NPM, ['view', 'openclaw', 'version'], { timeout: 30000 });
+  if (r.status !== 0) throw new Error(`npm view failed: ${r.stderr || r.stdout}`);
+  return r.stdout.trim();
+}
+
+function loadManifest() {
+  if (!existsSync(MANIFEST)) return { schema: 1, events: [] };
+  try { return JSON.parse(readFileSync(MANIFEST, 'utf8')); }
+  catch { return { schema: 1, events: [], _corrupt: true }; }
+}
+
+function saveManifest(m) {
+  mkdirSync(dirname(MANIFEST), { recursive: true });
+  writeFileSync(MANIFEST, JSON.stringify(m, null, 2) + '\n');
+}
+
+function addEvent(event) {
+  const m = loadManifest();
+  m.events ||= [];
+  m.events.push({ timestamp: new Date().toISOString(), ...event });
+  if (event.current) m.current = event.current;
+  if (event.previous) m.previous = event.previous;
+  saveManifest(m);
+}
+
+// Transcript logger — tees stdout/stderr to a per-run log file so we can
+// reconstruct exactly what a promote/rollback/cleanup did, even days later.
+const LOG_DIR = resolve(OPENCLAW_DIR, 'logs', 'openclaw-update');
+let TRANSCRIPT_PATH = null;
+function installTranscript(label) {
+  try {
+    mkdirSync(LOG_DIR, { recursive: true });
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    TRANSCRIPT_PATH = resolve(LOG_DIR, `${ts}-${label}.log`);
+    const stream = createWriteStream(TRANSCRIPT_PATH, { flags: 'a' });
+    stream.write(`# openclaw-update ${label} @ ${new Date().toISOString()}\n`);
+    stream.write(`# argv: ${JSON.stringify(process.argv.slice(2))}\n\n`);
+    const wrap = (orig) => (chunk, enc, cb) => {
+      try { stream.write(chunk, enc); } catch {}
+      return orig(chunk, enc, cb);
+    };
+    const origOut = process.stdout.write.bind(process.stdout);
+    const origErr = process.stderr.write.bind(process.stderr);
+    process.stdout.write = wrap(origOut);
+    process.stderr.write = wrap(origErr);
+    process.on('exit', (code) => {
+      try { stream.write(`\n# exit ${code} @ ${new Date().toISOString()}\n`); stream.end(); } catch {}
+    });
+    console.log(`(transcript → ${TRANSCRIPT_PATH})`);
+  } catch (err) {
+    console.error(`(transcript setup failed, continuing: ${err.message})`);
+  }
+}
+
+function listVersions() {
+  if (!existsSync(VERSIONS_DIR)) return [];
+  return readdirSync(VERSIONS_DIR, { withFileTypes: true })
+    .filter(d => d.isDirectory())
+    .map(d => d.name)
+    .sort();
+}
+
+function versionDir(version) { return resolve(VERSIONS_DIR, version); }
+function packageDir(version) {
+  const dir = versionDir(version);
+  const npmLayout = resolve(dir, 'node_modules/openclaw');
+  const legacyLayout = resolve(dir, 'lib/node_modules/openclaw');
+  if (existsSync(npmLayout)) return npmLayout;
+  return legacyLayout;
+}
+
+function installDirForCurrent() {
+  if (existsSync(CURRENT_LINK) && lstatSync(CURRENT_LINK).isSymbolicLink()) return resolve(CURRENT_LINK, 'lib/node_modules/openclaw');
+  return BREW_INSTALL;
+}
+
+function output(obj, args, text) {
+  if (args.json) console.log(JSON.stringify(obj, null, 2));
+  else console.log(text ?? JSON.stringify(obj, null, 2));
+}
+
+function fetchChangelog(version) {
+  const cacheDir = resolve(OPENCLAW_DIR, 'cache/changelog');
+  mkdirSync(cacheDir, { recursive: true });
+  const cachePath = resolve(cacheDir, `openclaw-${version}.md`);
+  if (existsSync(cachePath)) return readFileSync(cachePath, 'utf8');
+  const url = `https://registry.npmjs.org/openclaw/-/openclaw-${version}.tgz`;
+  const r = spawnSync('sh', ['-c', `curl -sfL '${url}' | tar xz -O package/CHANGELOG.md 2>/dev/null`], { encoding: 'utf8', timeout: 60000, maxBuffer: 10 * 1024 * 1024 });
+  if (r.status !== 0 || !r.stdout) throw new Error(`fetch failed for openclaw-${version}.tgz`);
+  writeFileSync(cachePath, r.stdout);
+  return r.stdout;
+}
+
+function changelogDiff(latest, current) {
+  const cl = fetchChangelog(latest);
+  const startIdx = cl.indexOf(`## ${latest}`);
+  const endIdx = cl.indexOf(`## ${current}`);
+  const MAX = 40000;
+  if (startIdx === -1) return cl.slice(0, Math.min(cl.length, MAX));
+  const raw = (endIdx === -1 || endIdx < startIdx)
+    ? cl.slice(startIdx)
+    : cl.slice(startIdx, endIdx);
+  return raw.slice(0, MAX).trim();
+}
+
+function interpretPrompt(current, latest) {
+  return `An OpenClaw update from ${current} to ${latest} is available. Below is the changelog diff between these releases. Your job: decide whether ANYTHING in here is something Stephan should care about, and if so summarize.
+
+Stephan's setup:
+- Primary model: Anthropic Claude Opus 4.7 (anthropic/claude-opus-4-7).
+- Fallback: Anthropic Sonnet 4.6; also configured: Google Gemini, OpenAI Codex GPT-5.5.
+- Primary channels: Telegram (heavy use), Moby-Dock terminal, Jump Desktop.
+- Known pain points he has hit: Bonjour "CIAO ANNOUNCEMENT CANCELLED" crash loop (using OPENCLAW_DISABLE_BONJOUR=1 workaround); openclaw.json being clobbered by updates; gateway dying silently after updates.
+- Uses: alert-bus, heartbeat, Telegram topic routing, skills, MCP.
+
+Output a single JSON object (no markdown, no extra text):
+{
+  "summary": "item1; item2; item3",   // 3-5 short phrases, semicolon-separated, ≤50 chars each. Empty string if NOTHING is interesting.
+  "noteworthy": true|false,            // true ONLY if a TRULY compelling reason to update *today* (e.g., NEW MAJOR MODEL like Opus 4.8 / Sonnet 5; fix for a crash bug he has actually hit; critical security CVE). Polish, incremental plugin work, and unrelated provider integrations are NEVER noteworthy.
+  "breaking": true|false,             // true if this update requires manual action BEFORE promoting (e.g., openclaw.json schema migration, removed config field he relies on, changed behavior in Telegram routing/skills/MCP that would require config adjustment). False for standard updates even when there are behavior changes.
+  "breaking_notes": ""                // If breaking: true, one sentence describing exactly what manual step is needed before running openclaw-update promote. Empty string if breaking: false.
+}
+
+Be ruthless. The defaults are noteworthy: false, breaking: false. Most updates require no manual intervention. Only set "breaking" to true if you can identify a specific action Stephan must take before the gateway will restart cleanly on his existing config. Deprecation warnings alone are not breaking — only changes that would cause the gateway to fail or misbehave on startup.`;
+}
+
+async function cmdCheck(args) {
+  const current = currentVersion();
+  const latest = latestVersion();
+  const status = current === latest ? 'current' : 'stale';
+  const result = { status, current, latest };
+  if (args.interpret && status === 'stale') {
+    try {
+      result.changelog_diff = changelogDiff(latest, current);
+      result.interpretation_prompt = interpretPrompt(current, latest);
+    } catch (err) {
+      result.interpret_error = err.message;
+    }
+  }
+  output(result, args, status === 'current' ? `OpenClaw is current (${current}).` : `OpenClaw update available: ${current} → ${latest}`);
+  process.exit(status === 'current' ? 0 : 1);
+}
+
+function driftStatus() {
+  const migrated = existsSync(CURRENT_LINK) && lstatSync(CURRENT_LINK).isSymbolicLink();
+  const brewBin = '/opt/homebrew/bin/openclaw';
+  const stubOk = existsSync(brewBin) && readFileSync(brewBin, 'utf8').includes('openclaw is managed by openclaw-update');
+  const wrapper = resolve(OPENCLAW_DIR, 'bin/openclaw');
+  const which = run('which', ['openclaw'], { timeout: 5000 }).stdout.trim();
+  const interactiveWhich = spawnSync('/bin/zsh', ['-ic', 'which openclaw'], { encoding: 'utf8', timeout: 10000 }).stdout?.trim() || '';
+  const issues = [];
+  if (migrated && !stubOk) issues.push('brew openclaw binary is not the managed stub; possible npm install -g drift');
+  if (migrated && !existsSync(wrapper)) issues.push(`managed wrapper missing: ${wrapper}`);
+  if (migrated && interactiveWhich && interactiveWhich !== wrapper) issues.push(`interactive zsh resolves openclaw to ${interactiveWhich}, expected ${wrapper}`);
+  return { migrated, stubOk, which, interactiveWhich, issues };
+}
+
+function cmdStatus(args) {
+  const current = currentVersion();
+  const currentTarget = existsSync(CURRENT_LINK) ? readlink(CURRENT_LINK) : null;
+  const previousTarget = existsSync(PREVIOUS_LINK) ? readlink(PREVIOUS_LINK) : null;
+  const versions = listVersions();
+  const manifest = loadManifest();
+  const drift = driftStatus();
+  const obj = { current, currentTarget, previousTarget, versions, manifestCurrent: manifest.current, manifestPrevious: manifest.previous, drift };
+  const text = [
+    `current:  ${current ?? 'unknown'}${currentTarget ? ` (${currentTarget})` : ''}`,
+    `previous: ${previousTarget ? basename(previousTarget) : 'none'}`,
+    `versions: ${versions.join(', ') || 'none'}`,
+    `drift:    ${drift.issues.length ? drift.issues.join('; ') : 'none'}`,
+  ].join('\n');
+  output(obj, args, text);
+  process.exit(drift.issues.length ? 2 : 0);
+}
+
+function resolveRequestedVersion(v) {
+  if (!v || v === 'latest') return latestVersion();
+  if (v === 'current') return currentVersion();
+  return v;
+}
+
+function cmdStage(args) {
+  const requested = args._[1];
+  if (!requested) throw new Error('stage requires <version|latest>');
+  const version = resolveRequestedVersion(requested);
+  const dir = versionDir(version);
+  const pkg = packageDir(version);
+  if (existsSync(pkg)) {
+    console.log(`Already staged: ${version} at ${dir}`);
+    return;
+  }
+  mkdirSync(dir, { recursive: true });
+  console.log(`Staging openclaw@${version} into ${dir} ...`);
+  const r = run(NPM, ['install', '--prefix', dir, `openclaw@${version}`], { stdio: 'inherit', timeout: 300000 });
+  if (r.status !== 0) throw new Error(`npm install failed with ${r.status}`);
+  mkdirSync(resolve(dir, 'bin'), { recursive: true });
+  try { writeFileSync(resolve(dir, 'bin/openclaw'), `#!/bin/sh\nexec /opt/homebrew/bin/node \"${resolve(packageDir(version), 'openclaw.mjs')}\" \"$@\"\n`); } catch {}
+  // Compat: launchd plist + the global wrapper still reference the legacy layout
+  // `<version>/lib/node_modules/openclaw/...`. npm install --prefix produces
+  // `<version>/node_modules/openclaw/...`. We need a path shim that works for
+  // both. NOTE: a self-referencing `lib -> .` symlink causes macOS launchd to
+  // fail bootstrap with EIO error 5. The shim must be a real `lib/node_modules/`
+  // directory containing a single relative symlink `openclaw -> ../../node_modules/openclaw`.
+  try {
+    const libNm = resolve(dir, 'lib/node_modules');
+    const libNmOpenclaw = resolve(libNm, 'openclaw');
+    if (!existsSync(libNmOpenclaw) && existsSync(resolve(dir, 'node_modules/openclaw'))) {
+      mkdirSync(libNm, { recursive: true });
+      symlinkSync('../../node_modules/openclaw', libNmOpenclaw);
+    }
+  } catch {}
+  addEvent({ event: 'stage', version, path: dir });
+  console.log(`Staged ${version}. Next: openclaw-update promote ${version} --yes`);
+}
+
+
+function writeSandboxConfig(sandboxDir, port, configSource) {
+  // configSource: path to the openclaw.json to test. Defaults to the live config,
+  // but pass a custom path to dry-run a proposed edit before applying to live.
+  const src = configSource || resolve(OPENCLAW_DIR, 'openclaw.json');
+  if (!existsSync(src)) throw new Error(`missing ${src}`);
+  const cfg = JSON.parse(readFileSync(src, 'utf8'));
+
+  // Keep the user's real config shape, but make the sandbox non-invasive:
+  // alternate port, loopback bind, no channel polling/webhooks, no Tailscale/Bonjour.
+  cfg.gateway ||= {};
+  cfg.gateway.port = port;
+  cfg.gateway.bind = 'loopback';
+  cfg.gateway.auth = { mode: 'none' };
+  if (cfg.gateway.tailscale && typeof cfg.gateway.tailscale === 'object') cfg.gateway.tailscale.mode = 'off';
+  else cfg.gateway.tailscale = { mode: 'off', resetOnExit: false };
+  cfg.discovery ||= {};
+  cfg.discovery.mdns ||= {};
+  cfg.discovery.mdns.mode = 'off';
+  if (cfg.channels && typeof cfg.channels === 'object') {
+    for (const provider of Object.keys(cfg.channels)) {
+      if (cfg.channels[provider] && typeof cfg.channels[provider] === 'object') {
+        cfg.channels[provider].enabled = false;
+        cfg.channels[provider].accounts ||= {};
+        for (const acct of Object.keys(cfg.channels[provider].accounts)) {
+          if (cfg.channels[provider].accounts[acct] && typeof cfg.channels[provider].accounts[acct] === 'object') {
+            cfg.channels[provider].accounts[acct].enabled = false;
+          }
+        }
+      }
+    }
+  }
+  const cfgPath = resolve(sandboxDir, 'openclaw.json');
+  writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + '\n');
+  return cfgPath;
+}
+
+async function cmdSandboxTest(args) {
+  const requested = args._[1] || 'latest';
+  const version = resolveRequestedVersion(requested);
+  if (!existsSync(packageDir(version))) cmdStage({ ...args, _: ['stage', version] });
+  const installDir = packageDir(version);
+  if (!existsSync(resolve(installDir, 'dist/index.js'))) throw new Error(`staged install is missing dist/index.js: ${installDir}`);
+
+  const sandboxDir = mkdtempSync(resolve(tmpdir(), `openclaw-sandbox-${version}-`));
+  mkdirSync(resolve(sandboxDir, 'logs'), { recursive: true });
+  const cfgPath = writeSandboxConfig(sandboxDir, args.port, args.configSource);
+  if (args.configSource) console.log(`Using config source: ${args.configSource}`);
+  const out = resolve(sandboxDir, 'gateway.stdout.log');
+  const err = resolve(sandboxDir, 'gateway.err.log');
+  console.log(`Sandbox config: ${cfgPath}`);
+  console.log(`Starting openclaw@${version} on port ${args.port} ...`);
+
+  const child = spawn(NODE, [resolve(installDir, 'dist/index.js'), 'gateway', 'run', '--port', String(args.port), '--allow-unconfigured', '--bind', 'loopback'], {
+    env: {
+      ...process.env,
+      OPENCLAW_HOME: sandboxDir,
+      OPENCLAW_CONFIG_PATH: cfgPath,
+      OPENCLAW_GATEWAY_PORT: String(args.port),
+      OPENCLAW_DISABLE_BONJOUR: '1',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+    detached: true,
+  });
+  child.stdout.on('data', d => writeFileSync(out, d, { flag: 'a' }));
+  child.stderr.on('data', d => writeFileSync(err, d, { flag: 'a' }));
+
+  let report;
+  try {
+    report = await runSmoketest({
+      target: 'sandbox',
+      mode: args.quick ? 'quick' : 'full',
+      installDir,
+      configDir: sandboxDir,
+      port: args.port,
+      telegram: false, // test 09 is current/live only; sandbox must not touch real Telegram polling
+      models: args.withModels,
+      bonjourWatchSec: args.bonjourWatchSec,
+      verbose: args.verbose,
+      skip: args.skip,
+    });
+    if (args.json) console.log(JSON.stringify({ version, sandboxDir, report }, null, 2));
+    else console.log(formatTextReport(report));
+  } finally {
+    try { process.kill(-child.pid, 'SIGTERM'); } catch {}
+    setTimeout(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch {} }, 3000).unref();
+  }
+  process.exit(report?.failed ? 1 : 0);
+}
+
+async function cmdSmoketest(args) {
+  const report = await runSmoketest({
+    target: 'current',
+    mode: args.quick ? 'quick' : 'full',
+    installDir: installDirForCurrent(),
+    configDir: OPENCLAW_DIR,
+    port: 18789,
+    telegram: args.telegram,
+    models: args.withModels,
+    skip: args.skip,
+  });
+  if (args.json) console.log(JSON.stringify(report, null, 2));
+  else console.log(formatTextReport(report));
+  process.exit(report.failed ? 1 : 0);
+}
+
+function waitServiceGone(label, maxMs = 30000) {
+  // launchctl bootout is async; the service can linger for several seconds.
+  // Issuing `bootstrap` while the old job is still tearing down throws
+  // "Bootstrap failed: 5: Input/output error". Poll launchctl print until the
+  // service is fully unloaded.
+  const target = `gui/${process.getuid()}/${label}`;
+  const deadline = Date.now() + maxMs;
+  while (Date.now() < deadline) {
+    const r = spawnSync('launchctl', ['print', target], { encoding: 'utf8', timeout: 5000 });
+    // exit 113 / "Could not find service" → fully unloaded
+    if (r.status !== 0 && /Could not find service/.test(r.stderr + r.stdout)) return true;
+    spawnSync('sleep', ['0.5']);
+  }
+  return false;
+}
+
+function restartGateway() {
+  console.log('  → launchctl bootout (waiting for service to unload)...');
+  // bootout may return non-zero if not loaded; ignore that case.
+  spawnSync('launchctl', ['bootout', `gui/${process.getuid()}/${GATEWAY_LABEL}`], { encoding: 'utf8', timeout: 15000 });
+  if (!waitServiceGone(GATEWAY_LABEL, 30000)) {
+    console.log('  ⚠ service still showing after 30s; proceeding anyway');
+  }
+  console.log('  → launchctl bootstrap...');
+  const r = run('launchctl', ['bootstrap', `gui/${process.getuid()}`, GATEWAY_PLIST], { timeout: 15000 });
+  if (r.status !== 0) throw new Error(`launchctl bootstrap failed: ${r.stderr || r.stdout}`);
+}
+
+function snapshotState(versionDirPath) {
+  const r = spawnSync('bash', ['-c', `source "${SNAPSHOT_HELPER}" && snapshot_state "${versionDirPath}"`], { encoding: 'utf8', timeout: 30000 });
+  if (r.status !== 0) throw new Error(`state snapshot failed: ${(r.stderr || r.stdout || '').trim()}`);
+  process.stdout.write(r.stdout);
+}
+
+const DM_CHAT_ID = 8290418965;
+const ALERT_BUS_TG = resolve(homedir(), 'clawd/moby-os/intelligence/alert-bus/lib/telegram-post.mjs');
+
+async function announceToDM(text) {
+  try {
+    const { sendMessage } = await import(ALERT_BUS_TG);
+    const r = await sendMessage({ chat_id: DM_CHAT_ID, thread_id: null, text });
+    if (!r.ok) console.log(`  notify failed (non-fatal): ${r.reason}`);
+    else console.log(`  posted to DM (message_id=${r.message_id})`);
+  } catch (err) {
+    console.log(`  notify skipped (non-fatal): ${err.message}`);
+  }
+}
+
+function tagClawdGit(oldVersion, newVersion) {
+  if (!existsSync(resolve(CLAWD_DIR, '.git'))) {
+    console.log('  ~/clawd is not a git repo — skipping git tag');
+    return null;
+  }
+  const ts = new Date().toISOString().replace(/[:.]/g, '-');
+  const tagName = `openclaw-update-pre-${ts}-from-${oldVersion}-to-${newVersion}`;
+  const status = spawnSync('git', ['-C', CLAWD_DIR, 'status', '--porcelain'], { encoding: 'utf8', timeout: 10000 });
+  const dirty = (status.stdout || '').trim().length > 0;
+  if (dirty) {
+    console.log('  ~/clawd has uncommitted changes — committing them so the tag is meaningful');
+    spawnSync('git', ['-C', CLAWD_DIR, 'add', '-A'], { encoding: 'utf8', timeout: 30000 });
+    spawnSync('git', ['-C', CLAWD_DIR, 'commit', '-m', `wip: pre-openclaw-update-${newVersion}`], { encoding: 'utf8', timeout: 30000 });
+  }
+  const tag = spawnSync('git', ['-C', CLAWD_DIR, 'tag', tagName], { encoding: 'utf8', timeout: 10000 });
+  if (tag.status !== 0) {
+    console.log(`  git tag failed (non-fatal): ${(tag.stderr || tag.stdout).trim()}`);
+    return null;
+  }
+  // Best-effort push, do not fail promote on push failure
+  const push = spawnSync('git', ['-C', CLAWD_DIR, 'push', 'origin', '--tags'], { encoding: 'utf8', timeout: 30000 });
+  if (push.status !== 0) console.log(`  git tag pushed locally only (push failed): ${(push.stderr || push.stdout).trim().slice(0, 120)}`);
+  else console.log(`  ~/clawd tagged: ${tagName} (pushed)`);
+  return tagName;
+}
+
+function assertBonjourDisabled() {
+  // Belt-and-suspenders pre-flight: refuse to promote unless at least one
+  // Bonjour kill-switch is active. Without this, the gateway can crash-loop
+  // on macOS during the post-promote restart and lock the user out.
+  const plistPath = resolve(process.env.HOME, 'Library/LaunchAgents/ai.openclaw.gateway.plist');
+  let envGuard = false;
+  if (existsSync(plistPath)) {
+    const plist = readFileSync(plistPath, 'utf8');
+    const idx = plist.indexOf('OPENCLAW_DISABLE_BONJOUR');
+    envGuard = idx !== -1 && /<string>1<\/string>/.test(plist.slice(idx));
+  }
+  let configGuard = false;
+  const cfgPath = resolve(OPENCLAW_DIR, 'openclaw.json');
+  if (existsSync(cfgPath)) {
+    try {
+      const c = JSON.parse(readFileSync(cfgPath, 'utf8'));
+      configGuard = c?.discovery?.mdns?.mode === 'off';
+    } catch {}
+  }
+  if (!envGuard && !configGuard) {
+    throw new Error(
+      'Bonjour is NOT disabled. Refusing to promote — gateway may crash-loop after restart.\n' +
+      '  Fix: set discovery.mdns.mode = "off" in ~/.openclaw/openclaw.json,\n' +
+      '       OR add OPENCLAW_DISABLE_BONJOUR=1 to ~/Library/LaunchAgents/ai.openclaw.gateway.plist.'
+    );
+  }
+  console.log(`Bonjour guard: env=${envGuard ? 'on' : 'off'} config=${configGuard ? 'on' : 'off'}`);
+}
+
+async function cmdPromote(args) {
+  const version = args._[1];
+  if (!version) throw new Error('promote requires <version>');
+  if (!args.yes && !args.dryRun) throw new Error('promote requires --yes (or --dry-run)');
+  if (!args.dryRun) installTranscript(`promote-${version}`);
+  assertBonjourDisabled();
+  const target = versionDir(version);
+  if (!existsSync(packageDir(version))) throw new Error(`version is not staged: ${version}. Run openclaw-update stage ${version}`);
+  const oldTarget = existsSync(CURRENT_LINK) ? readlink(CURRENT_LINK) : null;
+  const oldVersion = oldTarget ? basename(oldTarget) : currentVersion();
+  console.log(`Promoting ${oldVersion ?? 'unknown'} → ${version}`);
+  if (args.dryRun) { console.log(`[dry-run] would set current -> versions/${version}, restart gateway, run smoketest`); return; }
+
+  mkdirSync(OPENCLAW_DIR, { recursive: true });
+  if (oldTarget) {
+    // `previous` may be a symlink-to-directory; rmSync() defaults complain about
+    // "Path is a directory". Use unlinkSync on symlinks, rmSync(recursive) on real dirs.
+    if (existsSync(PREVIOUS_LINK)) {
+      try {
+        if (lstatSync(PREVIOUS_LINK).isSymbolicLink()) unlinkSync(PREVIOUS_LINK);
+        else rmSync(PREVIOUS_LINK, { recursive: true, force: true });
+      } catch (err) {
+        throw new Error(`cannot remove ~/.openclaw/previous (${err.message})`);
+      }
+    }
+    process.chdir(OPENCLAW_DIR);
+    run('ln', ['-sfn', `versions/${oldVersion}`, 'previous']);
+  }
+  const cfg = resolve(OPENCLAW_DIR, 'openclaw.json');
+  if (existsSync(cfg)) cpSync(cfg, resolve(OPENCLAW_DIR, `openclaw.json.pre-promote-${new Date().toISOString().replace(/[:.]/g, '-')}`), { force: true });
+
+  // §13.2 — Snapshot config state into the OLD version's dir before we leave it.
+  // On future rollback, this is what restores the openclaw.json that old version expects.
+  if (oldTarget && existsSync(oldTarget)) {
+    console.log(`Snapshotting ~/.openclaw config into versions/${oldVersion}/.state-snapshot/`);
+    try { snapshotState(oldTarget); }
+    catch (err) { console.log(`  snapshot warning: ${err.message}`); }
+  }
+
+  // §13.3 — Tag ~/clawd so rollback can show drift since the promote.
+  const clawdTag = tagClawdGit(oldVersion ?? 'unknown', version);
+
+  process.chdir(OPENCLAW_DIR);
+  run('ln', ['-sfn', `versions/${version}`, 'current']);
+  addEvent({ event: 'promote', current: version, previous: oldVersion, path: target, clawdTag });
+
+  try {
+    restartGateway();
+    const report = await runSmoketest({ target: 'current', mode: 'quick', installDir: packageDir(version), configDir: OPENCLAW_DIR, port: 18789, models: args.withModels });
+    console.log(formatTextReport(report));
+    if (report.failed) throw new Error('post-promote smoketest failed');
+    console.log(`Promote successful: ${version}`);
+    const okCount = report.passed;
+    const totalCount = report.passed + report.failed;
+    await announceToDM(
+      `OpenClaw ${version} is live. Live smoke test: ${okCount}/${totalCount} passed. Previous version retained at ~/.openclaw/versions/${oldVersion}/. Rollback: openclaw-rollback`
+    );
+  } catch (err) {
+    console.error(`Promote failed: ${err.message}`);
+    console.error('Attempting automatic rollback...');
+    run(resolve(HERE, 'openclaw-rollback'), [], { stdio: 'inherit', timeout: 120000 });
+    await announceToDM(
+      `OpenClaw promote to ${version} FAILED: ${err.message.slice(0, 200)}. Auto-rolled back to ${oldVersion}. Check ~/clawd/clawd-resilience/openclaw-update/forensics/ for details.`
+    );
+    process.exit(1);
+  }
+}
+
+function cmdRollback() {
+  installTranscript('rollback');
+  const r = run(resolve(HERE, 'openclaw-rollback'), [], { stdio: 'inherit', timeout: 120000 });
+  process.exit(r.status ?? 0);
+}
+
+function cmdCleanup(args) {
+  if (!args.yes && !args.dryRun) throw new Error('cleanup requires --yes (or --dry-run)');
+  if (!args.dryRun) installTranscript('cleanup');
+  const current = existsSync(CURRENT_LINK) ? basename(readlink(CURRENT_LINK)) : null;
+  const previous = existsSync(PREVIOUS_LINK) ? basename(readlink(PREVIOUS_LINK)) : null;
+  const protectedSet = new Set([current, previous].filter(Boolean));
+  const candidates = listVersions().filter(v => !protectedSet.has(v) && !v.includes('.broken-')).sort().reverse();
+  const remove = candidates.slice(args.keep);
+  if (!remove.length) { console.log('Nothing to clean.'); return; }
+  for (const v of remove) {
+    const p = versionDir(v);
+    if (args.dryRun) console.log(`[dry-run] remove ${p}`);
+    else { rmSync(p, { recursive: true, force: true }); console.log(`removed ${p}`); }
+  }
+  if (!args.dryRun) addEvent({ event: 'cleanup', removed: remove });
+}
+
+async function main() {
+  const args = parse(process.argv);
+  const cmd = args._[0] || 'status';
+  if (cmd === 'check') await cmdCheck(args);
+  else if (cmd === 'status') cmdStatus(args);
+  else if (cmd === 'stage') cmdStage(args);
+  else if (cmd === 'sandbox-test') await cmdSandboxTest(args);
+  else if (cmd === 'smoketest') await cmdSmoketest(args);
+  else if (cmd === 'promote') await cmdPromote(args);
+  else if (cmd === 'rollback') cmdRollback(args);
+  else if (cmd === 'cleanup') cmdCleanup(args);
+  else { usage(); process.exit(64); }
+}
+
+main().catch(err => {
+  console.error(`openclaw-update: ${err.message}`);
+  process.exit(1);
+});

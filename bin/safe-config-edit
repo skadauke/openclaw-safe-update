@@ -1,0 +1,334 @@
+#!/usr/bin/env node
+// safe-config-edit — atomic openclaw.json edit with auto-rollback.
+//
+// Usage:
+//   safe-config-edit --candidate <file.json> [--note <label>] [--no-restart]
+//   safe-config-edit --rollback                 # restore from the last pre-edit backup
+//
+// What it does on edit:
+//   1. Backs up current openclaw.json → openclaw.json.pre-<note>-<TS>
+//   2. Copies <candidate> into place
+//   3. Kickstarts the gateway (forces hot-reload + restart)
+//   4. Polls /healthz for up to 60s
+//   5. If unhealthy, restores backup and kickstarts again. Exits non-zero.
+//
+// What it does on rollback:
+//   Finds the most recent openclaw.json.pre-* backup, swaps it in, kickstarts gateway.
+
+import { spawnSync } from 'node:child_process';
+import { existsSync, readFileSync, writeFileSync, copyFileSync, readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs';
+import { resolve, basename, dirname } from 'node:path';
+import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const SAFE_STATE = resolve(HERE, 'safe-state');
+const OPENCLAW_DIR = resolve(homedir(), '.openclaw');
+const CFG_PATH = resolve(OPENCLAW_DIR, 'openclaw.json');
+// 5.28 split logs: plaintext gateway.err.log is mostly dead, real errors go to
+// gateway-structured.log (JSON). Scan both — regex still matches against raw
+// JSON because the message text is in the "message" field as a substring.
+const ERR_LOGS = [
+  resolve(OPENCLAW_DIR, 'logs/gateway-structured.log'),
+  resolve(OPENCLAW_DIR, 'logs/gateway.err.log'),
+];
+
+// ─── safe-state delegation ─────────────────────────────────────────────────
+// All snapshot/restore now goes through safe-state (git-backed). We keep the
+// legacy openclaw.json.pre-* sidecar copy too — it's cheap, easy to inspect
+// by hand, and provides a belt-and-suspenders backup if the state repo is
+// somehow corrupted.
+
+function safeState(args, opts = {}) {
+  const r = spawnSync('node', [SAFE_STATE, ...args], {
+    encoding: 'utf8',
+    timeout: opts.timeout ?? 60000,
+    stdio: opts.stdio ?? ['ignore', 'pipe', 'pipe'],
+  });
+  return r;
+}
+
+function safeStateOrThrow(args, opts) {
+  const r = safeState(args, opts);
+  if (r.status !== 0) {
+    throw new Error(`safe-state ${args.join(' ')} failed: ${(r.stderr || r.stdout || '').trim()}`);
+  }
+  return r;
+}
+
+function ensureSafeStateInit() {
+  // Auto-init if the state repo doesn't exist yet
+  const gitDir = resolve(HERE, '..', 'state-repo.git');
+  if (!existsSync(gitDir)) {
+    console.log('  → safe-state not initialized; running init…');
+    safeStateOrThrow(['init']);
+  }
+}
+
+function snapshotState(note) {
+  ensureSafeStateInit();
+  const r = safeStateOrThrow(['snapshot', `cfg-${note}`]);
+  const m = r.stdout.match(/snapshot:\s+([0-9a-f]{7,40})/);
+  if (!m) throw new Error(`couldn't parse snapshot sha from safe-state output:\n${r.stdout}`);
+  return m[1];
+}
+
+function restoreState(sha) {
+  safeStateOrThrow(['restore', sha]);
+}
+
+function latestSnapshotSha() {
+  const r = safeStateOrThrow(['log', '-n', '1']);
+  const m = r.stdout.trim().match(/^([0-9a-f]{7,40})/);
+  return m ? m[1] : null;
+}
+// Fatal patterns in gateway.err.log that mean the daemon will NOT recover by
+// itself — don't wait the full 60s health window when we see these.
+const FATAL_PATTERNS = [
+  /Gateway failed to start/i,
+  /Invalid config/i,
+  /Cannot find module/i,
+  /EADDRINUSE/i,
+  /Uncaught (Exception|Error)/i,
+  /panic:/i,
+  /SyntaxError/i,
+];
+const FATAL_REPEAT_THRESHOLD = 2; // require >=2 distinct fatal lines (proves it's looping, not a stale tail)
+const GATEWAY_LABEL = 'ai.openclaw.gateway';
+const GATEWAY_PLIST = resolve(homedir(), `Library/LaunchAgents/${GATEWAY_LABEL}.plist`);
+const PORT = 18789;
+const DM_CHAT_ID = 8290418965;
+const ALERT_BUS_TG = resolve(homedir(), 'clawd/moby-os/intelligence/alert-bus/lib/telegram-post.mjs');
+
+async function notify(text) {
+  // Best-effort Telegram DM via direct Bot API (bypasses gateway, so still works
+  // briefly while gateway is restarting).
+  try {
+    const { sendMessage } = await import(ALERT_BUS_TG);
+    const r = await sendMessage({ chat_id: DM_CHAT_ID, thread_id: null, text });
+    if (r.ok) console.log(`  → telegram: posted (message_id=${r.message_id})`);
+    else console.log(`  → telegram: failed (${r.reason})`);
+  } catch (err) {
+    console.log(`  → telegram: skipped (${err.message})`);
+  }
+}
+
+function parse(argv) {
+  const args = { rollback: false, candidate: null, note: 'edit', restart: true };
+  for (let i = 2; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--rollback') args.rollback = true;
+    else if (a === '--candidate') args.candidate = argv[++i];
+    else if (a === '--note') args.note = argv[++i].replace(/[^a-zA-Z0-9_-]/g, '-');
+    else if (a === '--no-restart') args.restart = false;
+    else if (a === '-h' || a === '--help') {
+      console.log(`Usage:
+  safe-config-edit --candidate <file.json> [--note <label>]
+  safe-config-edit --rollback`);
+      process.exit(0);
+    }
+    else throw new Error(`unknown arg: ${a}`);
+  }
+  return args;
+}
+
+function ts() {
+  const d = new Date();
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}T${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+function listPreBackups() {
+  return readdirSync(OPENCLAW_DIR)
+    .filter(f => f.startsWith('openclaw.json.pre-'))
+    .map(f => ({ name: f, mtime: statSync(resolve(OPENCLAW_DIR, f)).mtimeMs }))
+    .sort((a, b) => b.mtime - a.mtime);
+}
+
+function kickstart() {
+  const uid = process.getuid();
+  // bootout may fail if not loaded; that's fine.
+  spawnSync('launchctl', ['kickstart', '-k', `gui/${uid}/${GATEWAY_LABEL}`], { encoding: 'utf8', timeout: 15000 });
+}
+
+// Snapshot err-log sizes so we only inspect bytes written AFTER the kickstart.
+function errLogBaseline() {
+  const sizes = {};
+  for (const path of ERR_LOGS) {
+    try { sizes[path] = statSync(path).size; } catch { sizes[path] = 0; }
+  }
+  return sizes;
+}
+
+// Read bytes added since baseline across all watched logs, concatenated.
+// Returns '' on any error so we degrade to the slow health-check path.
+function readErrLogSince(baseline) {
+  let out = '';
+  for (const path of ERR_LOGS) {
+    try {
+      const sz = statSync(path).size;
+      const start = baseline[path] ?? 0;
+      if (sz <= start) continue;
+      const len = sz - start;
+      const fd = openSync(path, 'r');
+      try {
+        const buf = Buffer.alloc(len);
+        readSync(fd, buf, 0, len, start);
+        out += buf.toString('utf8');
+      } finally { closeSync(fd); }
+    } catch { /* skip this log on error */ }
+  }
+  return out;
+}
+
+function detectFatal(newText) {
+  if (!newText) return null;
+  const lines = newText.split('\n').filter(Boolean);
+  const fatal = [];
+  for (const line of lines) {
+    for (const pat of FATAL_PATTERNS) {
+      if (pat.test(line)) { fatal.push(line.slice(0, 240)); break; }
+    }
+  }
+  if (fatal.length < FATAL_REPEAT_THRESHOLD) return null;
+  // Return the most recent distinct fatal line + count.
+  const uniq = [...new Set(fatal)];
+  return { count: fatal.length, sample: uniq[uniq.length - 1] };
+}
+
+async function waitHealthy(maxSec = 60, errBaseline = null) {
+  // errBaseline MUST be captured BEFORE kickstart by the caller. 5.28's
+  // launchd retries are throttled — if the new process writes fatal lines
+  // immediately and then launchd backs off, capturing baseline after
+  // kickstart would miss those lines (they'd be considered "old").
+  const url = `http://127.0.0.1:${PORT}/healthz`;
+  const start = Date.now();
+  const deadline = start + maxSec * 1000;
+  if (!errBaseline) errBaseline = errLogBaseline();
+  let lastErr = '';
+  while (Date.now() < deadline) {
+    // Fast-fail: if gateway is logging fatal errors on each LaunchAgent retry,
+    // no amount of waiting will help.
+    const fatal = detectFatal(readErrLogSince(errBaseline));
+    if (fatal) {
+      const elapsed = Math.round((Date.now() - start) / 1000);
+      return { ok: false, lastErr: fatal.sample, fastFail: true, fatalCount: fatal.count, elapsed };
+    }
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(2000) });
+      if (r.ok) {
+        const body = await r.json().catch(() => ({}));
+        if (body.ok) return { ok: true, elapsed: Math.round((Date.now() - start) / 1000) };
+      }
+      lastErr = `HTTP ${r.status}`;
+    } catch (err) {
+      lastErr = err.message;
+    }
+    await new Promise(r => setTimeout(r, 1500));
+  }
+  return { ok: false, lastErr };
+}
+
+function readJson(p) {
+  try { JSON.parse(readFileSync(p, 'utf8')); return true; }
+  catch { return false; }
+}
+
+async function doEdit(args) {
+  if (!args.candidate) throw new Error('--candidate <file.json> required');
+  if (!existsSync(args.candidate)) throw new Error(`candidate not found: ${args.candidate}`);
+  if (!readJson(args.candidate)) throw new Error(`candidate is not valid JSON: ${args.candidate}`);
+
+  // Belt-and-suspenders: legacy sidecar (easy hand-inspect) + safe-state snapshot
+  // (full tree, idempotent restore). On rollback we prefer safe-state.
+  const backup = resolve(OPENCLAW_DIR, `openclaw.json.pre-${args.note}-${ts()}`);
+  copyFileSync(CFG_PATH, backup);
+  console.log(`✓ sidecar backup: ${basename(backup)}`);
+
+  const snapshotSha = snapshotState(args.note);
+  console.log(`✓ state snapshot: ${snapshotSha.slice(0, 12)}`);
+
+  copyFileSync(args.candidate, CFG_PATH);
+  console.log(`✓ wrote candidate → ${CFG_PATH}`);
+
+  if (!args.restart) {
+    console.log('--no-restart: skipping gateway restart. Verify manually.');
+    return;
+  }
+
+  console.log('→ kickstart gateway…');
+  const errBaseline1 = errLogBaseline();
+  kickstart();
+
+  console.log('→ waiting for /healthz…');
+  const h = await waitHealthy(60, errBaseline1);
+  if (h.ok) {
+    console.log(`✓ gateway healthy in ${h.elapsed}s`);
+    await notify(`✅ OpenClaw config edit "${args.note}" applied; gateway healthy in ${h.elapsed}s. Backup: ${basename(backup)}. Revert: safe-config-edit --rollback`);
+    console.log(`To revert: safe-config-edit --rollback`);
+    return;
+  }
+
+  if (h.fastFail) {
+    console.error(`✗ fast-fail: gateway crash-looping after ${h.elapsed}s (×${h.fatalCount} fatal log lines)`);
+    console.error(`  ${h.lastErr}`);
+    console.error(`→ rolling back to ${snapshotSha.slice(0, 12)}…`);
+  } else {
+    console.error(`✗ gateway unhealthy after 60s (${h.lastErr}); rolling back to ${snapshotSha.slice(0, 12)}…`);
+  }
+  try {
+    restoreState(snapshotSha);
+  } catch (err) {
+    console.error(`⚠️ safe-state restore failed (${err.message}); falling back to sidecar copy`);
+    copyFileSync(backup, CFG_PATH);
+  }
+  const errBaseline2 = errLogBaseline();
+  kickstart();
+  const h2 = await waitHealthy(60, errBaseline2);
+  if (h2.ok) {
+    console.error(`✓ rolled back; gateway healthy in ${h2.elapsed}s`);
+    const reason = h.fastFail
+      ? `fast-fail after ${h.elapsed}s: ${h.lastErr}`
+      : h.lastErr;
+    await notify(`⚠️ OpenClaw config edit "${args.note}" FAILED (${reason}); auto-rolled back, gateway healthy in ${h2.elapsed}s. Backup retained: ${basename(backup)}`);
+    process.exit(1);
+  }
+  console.error(`✗✗ ROLLBACK ALSO UNHEALTHY (${h2.lastErr}). Manual intervention required.`);
+  console.error(`Backup file: ${backup}`);
+  console.error(`Try: launchctl bootout gui/$(id -u)/${GATEWAY_LABEL} && launchctl bootstrap gui/$(id -u) ${GATEWAY_PLIST}`);
+  await notify(`🚨 OpenClaw config edit "${args.note}" CRITICAL: rollback also unhealthy (${h2.lastErr}). Backup: ${backup}. Manual intervention needed.`);
+  process.exit(2);
+}
+
+async function doRollback() {
+  // Prefer safe-state (full tree). Fall back to sidecar copy if state repo
+  // is missing or empty.
+  ensureSafeStateInit();
+  const sha = latestSnapshotSha();
+  if (sha) {
+    console.log(`→ restoring state snapshot ${sha.slice(0, 12)}`);
+    restoreState(sha);
+  } else {
+    const backups = listPreBackups();
+    if (!backups.length) throw new Error('no safe-state snapshots and no openclaw.json.pre-* backups found');
+    const newest = backups[0];
+    console.log(`→ no state snapshots; restoring sidecar ${newest.name}`);
+    copyFileSync(resolve(OPENCLAW_DIR, newest.name), CFG_PATH);
+  }
+  const errBaseline = errLogBaseline();
+  kickstart();
+  const h = await waitHealthy(60, errBaseline);
+  const label = sha ? `safe-state ${sha.slice(0, 12)}` : 'sidecar backup';
+  if (h.ok) {
+    console.log(`✓ gateway healthy in ${h.elapsed}s`);
+    await notify(`✅ OpenClaw config rolled back to ${label}; gateway healthy in ${h.elapsed}s`);
+  } else {
+    console.error(`✗ unhealthy after rollback (${h.lastErr})`);
+    await notify(`⚠️ OpenClaw config rollback to ${label} unhealthy (${h.lastErr}). Manual intervention needed.`);
+    process.exit(1);
+  }
+}
+
+const args = parse(process.argv);
+if (args.rollback) await doRollback();
+else await doEdit(args);

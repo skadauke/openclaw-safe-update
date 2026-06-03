@@ -1,0 +1,15 @@
+# Files in ~/.openclaw/ that are snapshotted before each promote and restored on rollback.
+# One path per line, relative to ~/.openclaw/. Glob expansion is NOT applied — list exact paths.
+# Lines starting with # are comments. Blank lines ignored.
+#
+# Add new entries when openclaw introduces new mutable config files that can change schema
+# between versions. Never add credentials/, memory/, sessions/, telegram/, devices/, etc. —
+# those are user state, not config.
+
+openclaw.json
+.environment
+exec-approvals.json
+state/routing-config-snapshot.json
+agents/main/agent/models.json
+agents/main/agent/auth-state.json
+agents/dev/agent/models.json
