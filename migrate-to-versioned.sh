@@ -136,14 +136,14 @@ log "Step B — Creating symlinks..."
 
 if [[ ! -L "$OPENCLAW_DIR/current" ]]; then
   ln -sfn "versions/$CURRENT_VER" "$OPENCLAW_DIR/current"
-  ok "~/.openclaw/current → versions/$CURRENT_VER"
+  ok "$HOME/.openclaw/current → versions/$CURRENT_VER"
 else
   skip "current symlink already exists: $(readlink "$OPENCLAW_DIR/current")"
 fi
 
 if [[ ! -L "$OPENCLAW_DIR/previous" ]]; then
   ln -sfn "versions/$CURRENT_VER" "$OPENCLAW_DIR/previous"
-  ok "~/.openclaw/previous → versions/$CURRENT_VER (same as current initially)"
+  ok "$HOME/.openclaw/previous → versions/$CURRENT_VER (same as current initially)"
 else
   skip "previous symlink already exists: $(readlink "$OPENCLAW_DIR/previous")"
 fi
@@ -162,7 +162,7 @@ else
 exec /opt/homebrew/bin/node "$HOME/.openclaw/current/lib/node_modules/openclaw/openclaw.mjs" "$@"
 WRAPPER_EOF
   chmod +x "$WRAPPER"
-  ok "~/.openclaw/bin/openclaw created."
+  ok "$HOME/.openclaw/bin/openclaw created."
 fi
 
 # ── Step D — Update launchd plist ───────────────────────────────────────────
