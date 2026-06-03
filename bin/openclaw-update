@@ -3,6 +3,12 @@
 // Safe-by-default: read-only commands do not mutate; mutating commands require
 // an explicit subcommand and, for promote/cleanup, --yes unless --dry-run.
 
+const [major, minor] = process.versions.node.split('.').map(Number);
+if (major < 22 || (major === 22 && minor < 19)) {
+  process.stderr.write(`openclaw-update requires Node.js 22.19+. Current: ${process.versions.node}\n`);
+  process.exit(1);
+}
+
 import { spawnSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, rmSync, lstatSync, renameSync, cpSync, symlinkSync, mkdtempSync, unlinkSync, createWriteStream, appendFileSync } from 'node:fs';
 import { resolve, dirname, basename } from 'node:path';
