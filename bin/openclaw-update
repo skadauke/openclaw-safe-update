@@ -601,9 +601,11 @@ async function cmdPromote(args) {
   run('ln', ['-sfn', `versions/${version}`, 'current']);
   addEvent({ event: 'promote', current: version, previous: oldVersion, path: target, clawdTag });
 
+  let smoketestReport = null;
   try {
     restartGateway();
     const report = await runSmoketest({ target: 'current', mode: 'quick', installDir: packageDir(version), configDir: OPENCLAW_DIR, port: 18789, models: args.withModels });
+    smoketestReport = report;
     console.log(formatTextReport(report));
     if (report.failed) throw new Error('post-promote smoketest failed');
     console.log(`Promote successful: ${version}`);
@@ -615,9 +617,17 @@ async function cmdPromote(args) {
   } catch (err) {
     console.error(`Promote failed: ${err.message}`);
     console.error('Attempting automatic rollback...');
-    run(resolve(HERE, 'openclaw-rollback'), [], { stdio: 'inherit', timeout: 120000 });
+    let rollbackEnv = process.env;
+    if (smoketestReport) {
+      try {
+        const tmpFile = resolve(tmpdir(), `openclaw-smoketest-${Date.now()}.json`);
+        writeFileSync(tmpFile, JSON.stringify(smoketestReport, null, 2) + '\n');
+        rollbackEnv = { ...process.env, OPENCLAW_SMOKETEST_RESULT_FILE: tmpFile };
+      } catch {}
+    }
+    run(resolve(HERE, 'openclaw-rollback'), [], { stdio: 'inherit', timeout: 120000, env: rollbackEnv });
     await notify(
-      `OpenClaw promote to ${version} FAILED: ${err.message.slice(0, 200)}. Auto-rolled back to ${oldVersion}.`
+      `OpenClaw promote to ${version} FAILED: ${err.message.slice(0, 200)}. Auto-rolled back to ${oldVersion}. Check ~/clawd/clawd-resilience/openclaw-update/forensics/ for details.`
     );
     process.exit(1);
   }
