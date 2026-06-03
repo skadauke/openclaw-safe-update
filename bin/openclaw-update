@@ -4,6 +4,7 @@
 // an explicit subcommand and, for promote/cleanup, --yes unless --dry-run.
 
 import { spawnSync, spawn } from 'node:child_process';
+import readline from 'node:readline';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, rmSync, lstatSync, renameSync, cpSync, symlinkSync, mkdtempSync, unlinkSync, createWriteStream, appendFileSync } from 'node:fs';
 import { resolve, dirname, basename } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
@@ -356,9 +357,7 @@ function writeSandboxConfig(sandboxDir, port, configSource) {
   return cfgPath;
 }
 
-async function cmdSandboxTest(args) {
-  const requested = args._[1] || 'latest';
-  const version = resolveRequestedVersion(requested);
+async function runSandboxTestCore(args, version) {
   if (!existsSync(packageDir(version))) cmdStage({ ...args, _: ['stage', version] });
   const installDir = packageDir(version);
   if (!existsSync(resolve(installDir, 'dist/index.js'))) throw new Error(`staged install is missing dist/index.js: ${installDir}`);
@@ -400,12 +399,19 @@ async function cmdSandboxTest(args) {
       verbose: args.verbose,
       skip: args.skip,
     });
-    if (args.json) console.log(JSON.stringify({ version, sandboxDir, report }, null, 2));
-    else console.log(formatTextReport(report));
   } finally {
     try { process.kill(-child.pid, 'SIGTERM'); } catch {}
     setTimeout(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch {} }, 3000).unref();
   }
+  return { report, sandboxDir };
+}
+
+async function cmdSandboxTest(args) {
+  const requested = args._[1] || 'latest';
+  const version = resolveRequestedVersion(requested);
+  const { report, sandboxDir } = await runSandboxTestCore(args, version);
+  if (args.json) console.log(JSON.stringify({ version, sandboxDir, report }, null, 2));
+  else console.log(formatTextReport(report));
   process.exit(report?.failed ? 1 : 0);
 }
 
@@ -619,10 +625,64 @@ function cmdCleanup(args) {
   if (!args.dryRun) addEvent({ event: 'cleanup', removed: remove });
 }
 
+async function cmdInteractive(args) {
+  const autoYes = args.yes || !process.stdin.isTTY;
+
+  async function ask(label) {
+    if (autoYes) { console.log(`${label} [auto]`); return true; }
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    return new Promise(res => {
+      rl.question(`${label} [y/N] `, answer => { rl.close(); res(answer.trim().toLowerCase() === 'y'); });
+    });
+  }
+
+  // [1/6] Check for updates
+  process.stdout.write('[1/6] Checking for updates... ');
+  const current = currentVersion();
+  const latest = latestVersion();
+  if (current === latest) {
+    console.log(`OpenClaw is current (${current}).`);
+    process.exit(0);
+  }
+  console.log(`${latest} available (current: ${current})`);
+
+  // [2/6] Stage?
+  if (!await ask('[2/6] Stage?')) { console.log('Aborted.'); process.exit(0); }
+  const t0 = Date.now();
+  cmdStage({ ...args, _: ['stage', latest] });
+  console.log(`[2/6] Staged ${latest} (${Math.round((Date.now() - t0) / 1000)}s)`);
+
+  // [3/6] Sandbox smoke test?
+  if (!await ask('[3/6] Sandbox smoke test?')) {
+    console.log('[3/6] Sandbox smoke test skipped.');
+  } else {
+    const { report } = await runSandboxTestCore({ ...args, _: ['sandbox-test', latest] }, latest);
+    const passed = report.passed, total = report.passed + report.failed;
+    console.log(`[3/6] Sandbox smoke test: ${passed}/${total} passed`);
+    if (report.failed) {
+      console.error(`Sandbox smoke test had ${report.failed} failure(s). Not promoting.`);
+      console.error(`Fix the issue or skip specific tests with --skip <ids> and re-run.`);
+      process.exit(1);
+    }
+  }
+
+  // [4/6] Promote?
+  if (!await ask('[4/6] Promote?')) {
+    console.log(`Aborted. ${latest} is staged — run: openclaw-update promote ${latest} --yes`);
+    process.exit(0);
+  }
+
+  await cmdPromote({ ...args, _: ['promote', latest], yes: true });
+
+  console.log('[5/6] Promote successful.');
+  console.log(`[6/6] Previous version retained at ~/.openclaw/versions/${current}/. Rollback: openclaw-rollback`);
+}
+
 async function main() {
   const args = parse(process.argv);
-  const cmd = args._[0] || 'status';
-  if (cmd === 'check') await cmdCheck(args);
+  const cmd = args._[0];
+  if (!cmd) await cmdInteractive(args);
+  else if (cmd === 'check') await cmdCheck(args);
   else if (cmd === 'status') cmdStatus(args);
   else if (cmd === 'stage') cmdStage(args);
   else if (cmd === 'sandbox-test') await cmdSandboxTest(args);
