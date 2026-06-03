@@ -476,15 +476,23 @@ function waitServiceGone(label, maxMs = 30000) {
 }
 
 function restartGateway() {
-  console.log('  → launchctl bootout (waiting for service to unload)...');
-  // bootout may return non-zero if not loaded; ignore that case.
-  spawnSync('launchctl', ['bootout', `gui/${process.getuid()}/${GATEWAY_LABEL}`], { encoding: 'utf8', timeout: 15000 });
-  if (!waitServiceGone(GATEWAY_LABEL, 30000)) {
-    console.log('  ⚠ service still showing after 30s; proceeding anyway');
+  if (process.platform === 'darwin') {
+    console.log('  → launchctl bootout (waiting for service to unload)...');
+    // bootout may return non-zero if not loaded; ignore that case.
+    spawnSync('launchctl', ['bootout', `gui/${process.getuid()}/${GATEWAY_LABEL}`], { encoding: 'utf8', timeout: 15000 });
+    if (!waitServiceGone(GATEWAY_LABEL, 30000)) {
+      console.log('  ⚠ service still showing after 30s; proceeding anyway');
+    }
+    console.log('  → launchctl bootstrap...');
+    const r = run('launchctl', ['bootstrap', `gui/${process.getuid()}`, GATEWAY_PLIST], { timeout: 15000 });
+    if (r.status !== 0) throw new Error(`launchctl bootstrap failed: ${r.stderr || r.stdout}`);
+  } else {
+    const userUnit = resolve(homedir(), `.config/systemd/user/${GATEWAY_LABEL}.service`);
+    const scope = existsSync(userUnit) ? ['--user'] : [];
+    console.log(`  → systemctl${scope.length ? ' --user' : ''} restart ${GATEWAY_LABEL}...`);
+    const r = run('systemctl', [...scope, 'restart', `${GATEWAY_LABEL}.service`], { timeout: 30000 });
+    if (r.status !== 0) throw new Error(`systemctl restart failed: ${r.stderr || r.stdout}`);
   }
-  console.log('  → launchctl bootstrap...');
-  const r = run('launchctl', ['bootstrap', `gui/${process.getuid()}`, GATEWAY_PLIST], { timeout: 15000 });
-  if (r.status !== 0) throw new Error(`launchctl bootstrap failed: ${r.stderr || r.stdout}`);
 }
 
 function snapshotState(versionDirPath) {
@@ -674,6 +682,34 @@ async function cmdUninstall(args) {
   }
   console.log('  ✓ Gateway healthy.');
 
+  // Verify current/previous symlinks point to real version directories (if migrated)
+  const currentLst = tryLstat(CURRENT_LINK);
+  const isMigrated = currentLst?.isSymbolicLink() ?? false;
+  if (isMigrated) {
+    const currentTarget = readlink(CURRENT_LINK);
+    if (!currentTarget || !existsSync(currentTarget)) {
+      throw new Error(
+        'The ~/.openclaw/current symlink is dangling — the target directory does not exist.\n' +
+        '  Diagnose: openclaw-update status'
+      );
+    }
+    const pkgNpm = resolve(currentTarget, 'node_modules/openclaw/package.json');
+    const pkgLegacy = resolve(currentTarget, 'lib/node_modules/openclaw/package.json');
+    if (!existsSync(pkgNpm) && !existsSync(pkgLegacy)) {
+      throw new Error(
+        `~/.openclaw/current points to ${currentTarget} but no openclaw package found there.\n` +
+        '  Diagnose: openclaw-update status'
+      );
+    }
+    const prevLst = tryLstat(PREVIOUS_LINK);
+    const prevTarget = prevLst?.isSymbolicLink() ? readlink(PREVIOUS_LINK) : null;
+    if (!prevTarget || !existsSync(prevTarget)) {
+      console.log('  ⚠ ~/.openclaw/previous is missing or dangling — no automated rollback if uninstall encounters issues.');
+    } else {
+      console.log('  ✓ Symlinks healthy: current and previous both resolve.');
+    }
+  }
+
   // Step 2 — Locate the system (pre-migration) openclaw package
   console.log('Step 2 — Locating system openclaw install...');
   let systemInstallDir = BREW_INSTALL; // /opt/homebrew/lib/node_modules/openclaw on macOS
@@ -703,31 +739,60 @@ async function cmdUninstall(args) {
   try { systemVersion = JSON.parse(readFileSync(systemPkg, 'utf8')).version; } catch {}
   console.log(`  ✓ Found system openclaw${systemVersion ? ` ${systemVersion}` : ''} at ${systemInstallDir}`);
 
-  // Step 3 — Restore launchd plist to point at the system install
-  console.log('Step 3 — Restoring launchd plist to system openclaw path...');
-  if (!existsSync(GATEWAY_PLIST)) throw new Error(`Gateway plist not found at ${GATEWAY_PLIST}`);
-  const plistContent = readFileSync(GATEWAY_PLIST, 'utf8');
+  // Step 3 — Restore launchd plist (macOS) or systemd unit (Linux) to system openclaw path
   const versionedEntry = `${homedir()}/.openclaw/current/lib/node_modules/openclaw/dist/index.js`;
-  if (!plistContent.includes(versionedEntry)) {
-    if (plistContent.includes(systemEntry)) {
-      console.log('  · Plist already points at system path — no change needed.');
+  if (process.platform === 'darwin') {
+    console.log('Step 3 — Restoring launchd plist to system openclaw path...');
+    if (!existsSync(GATEWAY_PLIST)) throw new Error(`Gateway plist not found at ${GATEWAY_PLIST}`);
+    const plistContent = readFileSync(GATEWAY_PLIST, 'utf8');
+    if (!plistContent.includes(versionedEntry)) {
+      if (plistContent.includes(systemEntry)) {
+        console.log('  · Plist already points at system path — no change needed.');
+      } else {
+        throw new Error(
+          `Cannot identify the managed plist entry to restore.\n` +
+          `  Expected to find: ${versionedEntry}\n` +
+          `  In plist: ${GATEWAY_PLIST}\n` +
+          `  The plist may have been manually edited. Inspect and restore it manually.`
+        );
+      }
+    } else if (args.dryRun) {
+      console.log(`  [dry-run] would update plist:\n    ${versionedEntry}\n    → ${systemEntry}`);
     } else {
-      throw new Error(
-        `Cannot identify the managed plist entry to restore.\n` +
-        `  Expected to find: ${versionedEntry}\n` +
-        `  In plist: ${GATEWAY_PLIST}\n` +
-        `  The plist may have been manually edited. Inspect and restore it manually.`
-      );
+      const TS = new Date().toISOString().replace(/[:.]/g, '-');
+      const plistBackup = `${GATEWAY_PLIST}.pre-uninstall-${TS}`;
+      cpSync(GATEWAY_PLIST, plistBackup, { force: true });
+      console.log(`  Backed up plist to ${plistBackup}`);
+      writeFileSync(GATEWAY_PLIST, plistContent.replaceAll(versionedEntry, systemEntry));
+      console.log(`  ✓ Plist updated → ${systemEntry}`);
     }
-  } else if (args.dryRun) {
-    console.log(`  [dry-run] would update plist:\n    ${versionedEntry}\n    → ${systemEntry}`);
   } else {
-    const TS = new Date().toISOString().replace(/[:.]/g, '-');
-    const plistBackup = `${GATEWAY_PLIST}.pre-uninstall-${TS}`;
-    cpSync(GATEWAY_PLIST, plistBackup, { force: true });
-    console.log(`  Backed up plist to ${plistBackup}`);
-    writeFileSync(GATEWAY_PLIST, plistContent.replaceAll(versionedEntry, systemEntry));
-    console.log(`  ✓ Plist updated → ${systemEntry}`);
+    console.log('Step 3 — Restoring systemd unit to system openclaw path...');
+    const userUnitPath = resolve(homedir(), `.config/systemd/user/${GATEWAY_LABEL}.service`);
+    const systemUnitPath = `/etc/systemd/system/${GATEWAY_LABEL}.service`;
+    const unitPath = existsSync(userUnitPath) ? userUnitPath : existsSync(systemUnitPath) ? systemUnitPath : null;
+    if (!unitPath) {
+      console.log('  · No systemd unit found — skipping unit file update.');
+      console.log(`    (Looked for: ${userUnitPath}  and  ${systemUnitPath})`);
+    } else {
+      const unitContent = readFileSync(unitPath, 'utf8');
+      if (!unitContent.includes(versionedEntry)) {
+        if (unitContent.includes(systemEntry)) {
+          console.log('  · Systemd unit already points at system path — no change needed.');
+        } else {
+          console.log(`  ⚠ Could not identify managed entry in ${unitPath} — inspect and update ExecStart manually.`);
+        }
+      } else if (args.dryRun) {
+        console.log(`  [dry-run] would update ${unitPath}:\n    ${versionedEntry}\n    → ${systemEntry}`);
+      } else {
+        const TS = new Date().toISOString().replace(/[:.]/g, '-');
+        cpSync(unitPath, `${unitPath}.pre-uninstall-${TS}`, { force: true });
+        writeFileSync(unitPath, unitContent.replaceAll(versionedEntry, systemEntry));
+        const scope = unitPath.startsWith(homedir()) ? ['--user'] : [];
+        spawnSync('systemctl', [...scope, 'daemon-reload'], { encoding: 'utf8', timeout: 10000 });
+        console.log(`  ✓ Systemd unit updated → ${systemEntry}`);
+      }
+    }
   }
 
   // Step 4 — Remove managed stub at /opt/homebrew/bin/openclaw if still present
@@ -784,9 +849,26 @@ async function cmdUninstall(args) {
   if (args.removeVersions) {
     if (args.dryRun) {
       console.log(`  [dry-run] would remove ${VERSIONS_DIR}`);
+      console.log(`  [dry-run] would remove dangling symlinks: ${CURRENT_LINK}, ${PREVIOUS_LINK}`);
+      console.log(`  [dry-run] would remove ${resolve(OPENCLAW_DIR, 'bin/openclaw')} wrapper`);
     } else if (existsSync(VERSIONS_DIR)) {
       rmSync(VERSIONS_DIR, { recursive: true, force: true });
       console.log(`  ✓ Removed ${VERSIONS_DIR}`);
+      // current/previous symlinks are now dangling — remove them
+      for (const link of [CURRENT_LINK, PREVIOUS_LINK]) {
+        if (tryLstat(link)?.isSymbolicLink()) {
+          try { unlinkSync(link); console.log(`  ✓ Removed dangling symlink: ${link}`); }
+          catch (err) { console.log(`  ⚠ Could not remove ${link}: ${err.message}`); }
+        }
+      }
+      // The ~/.openclaw/bin/openclaw wrapper now points at a deleted current/ target — remove it
+      const openclawWrapper = resolve(OPENCLAW_DIR, 'bin/openclaw');
+      if (tryLstat(openclawWrapper)) {
+        try { unlinkSync(openclawWrapper); console.log(`  ✓ Removed ${openclawWrapper}`); }
+        catch (err) { console.log(`  ⚠ Could not remove ${openclawWrapper}: ${err.message} (remove manually)`); }
+      }
+      console.log(`  To remove ~/.openclaw/bin from PATH, edit ~/.zshrc and delete the line:`);
+      console.log(`    export PATH="$HOME/.openclaw/bin:$PATH"`);
     } else {
       console.log('  · versions/ directory already gone — skipping.');
     }
