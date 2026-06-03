@@ -876,6 +876,16 @@ async function cmdUninstall(args) {
     if (existsSync(VERSIONS_DIR)) {
       console.log(`  Keeping ${VERSIONS_DIR} (default).`);
       console.log(`  To delete later:  rm -rf ${VERSIONS_DIR}`);
+      const openclawWrapper = resolve(OPENCLAW_DIR, 'bin/openclaw');
+      if (tryLstat(openclawWrapper)) {
+        console.log(`  ⚠ ${openclawWrapper} still exists and ~/.openclaw/bin may be in your PATH.`);
+        console.log(`    The 'openclaw' shell command will continue to invoke the managed version`);
+        console.log(`    while the gateway now runs the system version — these may differ.`);
+        console.log(`    To avoid confusion, remove the wrapper and update your PATH:`);
+        console.log(`      rm ${openclawWrapper}`);
+        console.log(`    Then edit ~/.zshrc (or ~/.bashrc) to remove the line:`);
+        console.log(`      export PATH="$HOME/.openclaw/bin:$PATH"`);
+      }
     }
   }
 
