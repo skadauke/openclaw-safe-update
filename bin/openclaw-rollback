@@ -98,7 +98,9 @@ tail -500 "$OPENCLAW_DIR/logs/gateway.err.log" 2>/dev/null > "$FD/gateway.err.lo
 cp "$OPENCLAW_DIR/openclaw.json" "$FD/openclaw.json.at-rollback" 2>/dev/null || true
 
 # Plist snapshot (macOS only)
-[[ "$PLATFORM" == "Darwin" ]] && cp "$PLIST" "$FD/gateway.plist.at-rollback" 2>/dev/null || true
+if [[ "$PLATFORM" == "Darwin" ]]; then
+  cp "$PLIST" "$FD/gateway.plist.at-rollback" 2>/dev/null || true
+fi
 
 # Manifest entry
 cat > "$FD/manifest.json" <<EOF
