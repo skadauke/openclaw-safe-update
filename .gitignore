@@ -1,4 +1,5 @@
 # Secret-bearing runtime artifacts — never commit
+.env
 forensics/
 state-repo.git/
 *.at-rollback
