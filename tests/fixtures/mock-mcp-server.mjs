@@ -11,6 +11,7 @@ rl.on('line', line => {
   if (!msg || !msg.method) return;
 
   if (msg.method === 'initialize') {
+    if (msg.id === undefined) return;
     process.stdout.write(JSON.stringify({
       jsonrpc: '2.0', id: msg.id,
       result: {
@@ -20,6 +21,7 @@ rl.on('line', line => {
       },
     }) + '\n');
   } else if (msg.method === 'tools/list') {
+    if (msg.id === undefined) return;
     process.stdout.write(JSON.stringify({
       jsonrpc: '2.0', id: msg.id,
       result: {
