@@ -2,8 +2,9 @@
 // the managed install. After migration: current symlink exists, brew binary is
 // our stub. Before migration: just verifies the expected homebrew path is in place.
 
-import { existsSync, readFileSync, lstatSync } from 'node:fs';
+import { existsSync, readFileSync, lstatSync, realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { homedir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 
 const BREW_BINARY = '/opt/homebrew/bin/openclaw';
@@ -30,8 +31,8 @@ export default {
       notes.push('versioned install detected');
 
       // 1. current symlink must resolve to the same installDir passed by the orchestrator
-      const r = spawnSync('readlink', ['-f', CURRENT_SYMLINK], { encoding: 'utf8' });
-      const resolved = (r.stdout || '').trim();
+      let resolved = '';
+      try { resolved = realpathSync(CURRENT_SYMLINK); } catch { /* ignore */ }
       if (!resolved) {
         issues.push('~/.openclaw/current symlink does not resolve');
       } else {
@@ -54,9 +55,17 @@ export default {
       const managedWrapper = resolve(ctx.configDir, 'bin/openclaw');
       if (!existsSync(managedWrapper)) {
         issues.push(`managed wrapper missing: ${managedWrapper}`);
+      } else if (managedWrapper !== resolve(homedir(), '.openclaw', 'bin', 'openclaw')) {
+        // The interactive-zsh PATH check only makes sense for the live default
+        // install. Against a mock/temp configDir (hermetic suite) the fixture
+        // wrapper is never on PATH, so the check can't say anything useful.
+        notes.push('managed wrapper present; skipping interactive-zsh PATH check (non-default configDir)');
       } else {
-        const whichR = spawnSync('/bin/zsh', ['-ic', 'which openclaw'], { encoding: 'utf8', env: process.env });
-        const which = (whichR.stdout || '').trim();
+        const whichR = spawnSync('/bin/zsh', ['-ic', 'which openclaw'], { encoding: 'utf8', env: process.env, timeout: 3000, killSignal: 'SIGKILL' });
+        // Only trust stdout as a resolved path when `which` exited 0. zsh's `which`
+        // builtin prints "openclaw not found" to stdout and returns 1 when the
+        // command isn't on PATH — that's "no drift", not a path.
+        const which = whichR.status === 0 ? (whichR.stdout || '').trim() : '';
         if (which && which !== managedWrapper) {
           issues.push(`interactive zsh resolves openclaw = ${which}, expected ${managedWrapper} — ~/.zshrc/.zprofile may be wrong`);
         } else {
