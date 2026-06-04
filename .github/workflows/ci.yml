@@ -4,16 +4,146 @@ on:
   push:
   pull_request:
 
+# Tests NOT covered by this workflow:
+# - Test #06 (cli-backend-session): requires live model inference
+# - Test #07 (models-roundtrip): requires live credentials
+# - Test #09 (telegram-roundtrip): requires Telegram bot token
+# - Full promote/rollback with real gateway restart: requires live openclaw install
+
 jobs:
-  shellcheck:
-    runs-on: ubuntu-latest
+  lint:
+    name: lint (${{ matrix.os }}, node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+        node: ["22.19", "24"]
     steps:
       - uses: actions/checkout@v4
-      - name: Install shellcheck
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: node-modules-${{ matrix.os }}-${{ matrix.node }}-${{ hashFiles('**/package-lock.json') }}
+
+      - name: Install shellcheck (macOS)
+        if: runner.os == 'macOS'
+        run: brew install shellcheck
+
+      - name: Install shellcheck (Linux)
+        if: runner.os == 'Linux'
         run: sudo apt-get install -y shellcheck
+
       - name: Run shellcheck
         run: |
           shellcheck -x migrate-to-versioned.sh \
                         bin/openclaw-rollback \
                         lib/state-snapshot.sh \
                         install.sh
+
+  unit-tests:
+    name: unit-tests (${{ matrix.os }}, node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+        node: ["22.19", "24"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: node-modules-${{ matrix.os }}-${{ matrix.node }}-${{ hashFiles('**/package-lock.json') }}
+
+      - name: Run unit tests
+        run: node tests/safe-state.test.mjs
+
+  # Validates the mock openclaw binary before the full smoketest matrix runs.
+  # The mock binary lives in tests/fixtures/ and has no npm dependencies.
+  mock-openclaw-ci:
+    name: mock-openclaw-ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.19"
+
+      - name: Verify mock openclaw binary
+        run: |
+          node tests/fixtures/mock-openclaw.mjs --version
+          node tests/fixtures/openclaw.mjs --version
+
+  smoketest-mock:
+    name: smoketest-mock (${{ matrix.os }}, node ${{ matrix.node }})
+    needs: mock-openclaw-ci
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+        node: ["22.19", "24"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: node-modules-${{ matrix.os }}-${{ matrix.node }}-${{ hashFiles('**/package-lock.json') }}
+
+      - name: Run smoketest with mock openclaw
+        # Exercises tests #01–#05, #08, #10–#15 against tests/fixtures/mock-openclaw.mjs.
+        # Skips #06 (requiresModels), #07 (requiresModels), #09 (requiresTelegram).
+        run: node tests/run-with-mock.mjs
+
+  node-version-check:
+    name: node-version-check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+
+      - name: Verify version error on old Node
+        shell: bash
+        run: |
+          set +e
+          output=$(node bin/openclaw-update 2>&1)
+          exit_code=$?
+          set -e
+          if [ "$exit_code" -ne 1 ]; then
+            echo "Expected exit code 1, got: $exit_code"
+            echo "Output: $output"
+            exit 1
+          fi
+          if ! echo "$output" | grep -q "requires Node.js 22.19+"; then
+            echo "Expected version error message not found. Output:"
+            echo "$output"
+            exit 1
+          fi
+          echo "OK: exited $exit_code with expected version error"
