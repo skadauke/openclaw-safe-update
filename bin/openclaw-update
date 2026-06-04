@@ -10,6 +10,7 @@ if (major < 22 || (major === 22 && minor < 19)) {
 }
 
 import { spawnSync, spawn } from 'node:child_process';
+import readline from 'node:readline';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, rmSync, lstatSync, renameSync, cpSync, symlinkSync, mkdtempSync, unlinkSync, createWriteStream, appendFileSync } from 'node:fs';
 import { resolve, dirname, basename } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
@@ -402,9 +403,7 @@ function writeSandboxConfig(sandboxDir, port, configSource) {
   return cfgPath;
 }
 
-async function cmdSandboxTest(args) {
-  const requested = args._[1] || 'latest';
-  const version = resolveRequestedVersion(requested);
+async function runSandboxTestCore(args, version) {
   if (!existsSync(packageDir(version))) cmdStage({ ...args, _: ['stage', version] });
   const installDir = packageDir(version);
   if (!existsSync(resolve(installDir, 'dist/index.js'))) throw new Error(`staged install is missing dist/index.js: ${installDir}`);
@@ -446,12 +445,19 @@ async function cmdSandboxTest(args) {
       verbose: args.verbose,
       skip: args.skip,
     });
-    if (args.json) console.log(JSON.stringify({ version, sandboxDir, report }, null, 2));
-    else console.log(formatTextReport(report));
   } finally {
     try { process.kill(-child.pid, 'SIGTERM'); } catch {}
     setTimeout(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch {} }, 3000).unref();
   }
+  return { report, sandboxDir };
+}
+
+async function cmdSandboxTest(args) {
+  const requested = args._[1] || 'latest';
+  const version = resolveRequestedVersion(requested);
+  const { report, sandboxDir } = await runSandboxTestCore(args, version);
+  if (args.json) console.log(JSON.stringify({ version, sandboxDir, report }, null, 2));
+  else console.log(formatTextReport(report));
   process.exit(report?.failed ? 1 : 0);
 }
 
@@ -559,7 +565,7 @@ async function cmdPromote(args) {
   if (!existsSync(packageDir(version))) throw new Error(`version is not staged: ${version}. Run openclaw-update stage ${version}`);
   const oldTarget = existsSync(CURRENT_LINK) ? readlink(CURRENT_LINK) : null;
   const oldVersion = oldTarget ? basename(oldTarget) : currentVersion();
-  console.log(`Promoting ${oldVersion ?? 'unknown'} → ${version}`);
+  if (!args.stepBase) console.log(`Promoting ${oldVersion ?? 'unknown'} → ${version}`);
   if (args.dryRun) { console.log(`[dry-run] would set current -> versions/${version}, restart gateway, run smoketest`); return; }
 
   mkdirSync(OPENCLAW_DIR, { recursive: true });
@@ -578,12 +584,16 @@ async function cmdPromote(args) {
     run('ln', ['-sfn', `versions/${oldVersion}`, 'previous']);
   }
   const cfg = resolve(OPENCLAW_DIR, 'openclaw.json');
-  if (existsSync(cfg)) cpSync(cfg, resolve(OPENCLAW_DIR, `openclaw.json.pre-promote-${new Date().toISOString().replace(/[:.]/g, '-')}`), { force: true });
+  if (existsSync(cfg)) {
+    const backupName = `openclaw.json.pre-promote-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+    cpSync(cfg, resolve(OPENCLAW_DIR, backupName), { force: true });
+    if (args.stepBase) console.log(`[${args.stepBase}a/6]   Backing up openclaw.json → ${backupName}`);
+  }
 
   // §13.2 — Snapshot config state into the OLD version's dir before we leave it.
   // On future rollback, this is what restores the openclaw.json that old version expects.
   if (oldTarget && existsSync(oldTarget)) {
-    console.log(`Snapshotting ~/.openclaw config into versions/${oldVersion}/.state-snapshot/`);
+    if (!args.stepBase) console.log(`Snapshotting ~/.openclaw config into versions/${oldVersion}/.state-snapshot/`);
     try { snapshotState(oldTarget); }
     catch (err) { console.log(`  snapshot warning: ${err.message}`); }
   }
@@ -593,16 +603,26 @@ async function cmdPromote(args) {
 
   process.chdir(OPENCLAW_DIR);
   run('ln', ['-sfn', `versions/${version}`, 'current']);
+  if (args.stepBase) console.log(`[${args.stepBase}b/6]   Swapping symlink → current → ${version}`);
   addEvent({ event: 'promote', current: version, previous: oldVersion, path: target, clawdTag });
 
   let smoketestReport = null;
   try {
     await platformRestartGateway(packageDir(version));
+    if (args.stepBase) console.log(`[${args.stepBase}c/6]   Reloading launchd → kickstart ok`);
     const report = await runSmoketest({ target: 'current', mode: 'quick', installDir: packageDir(version), configDir: OPENCLAW_DIR, port: 18789, models: args.withModels });
     smoketestReport = report;
-    console.log(formatTextReport(report));
+    if (args.stepBase) {
+      const total = report.passed + report.failed;
+      const failDetail = report.failed
+        ? ` (${report.results.filter(r => !r.ok).map(f => `#${String(f.id).padStart(2, '0')} ${f.name}: ${f.detail}`).join(', ')})`
+        : '';
+      console.log(`[${args.stepBase}d/6]   Live smoke test → ${report.passed}/${total} passed${failDetail}`);
+    } else {
+      console.log(formatTextReport(report));
+    }
     if (report.failed) throw new Error('post-promote smoketest failed');
-    console.log(`Promote successful: ${version}`);
+    if (!args.stepBase) console.log(`Promote successful: ${version}`);
     const okCount = report.passed;
     const totalCount = report.passed + report.failed;
     await notify(
@@ -653,6 +673,59 @@ function cmdCleanup(args) {
     else { rmSync(p, { recursive: true, force: true }); console.log(`removed ${p}`); }
   }
   if (!args.dryRun) addEvent({ event: 'cleanup', removed: remove });
+}
+
+async function cmdInteractive(args) {
+  const autoYes = args.yes || !process.stdin.isTTY;
+
+  async function ask(label) {
+    if (autoYes) { console.log(`${label} [auto]`); return true; }
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    return new Promise(res => {
+      rl.question(`${label} [y/N] `, answer => { rl.close(); res(answer.trim().toLowerCase() === 'y'); });
+    });
+  }
+
+  // [1/6] Check for updates
+  process.stdout.write('[1/6] Checking for updates... ');
+  const current = currentVersion();
+  const latest = latestVersion();
+  if (current === latest) {
+    console.log(`OpenClaw is current (${current}).`);
+    process.exit(0);
+  }
+  console.log(`${latest} available (current: ${current})`);
+
+  // [2/6] Stage?
+  if (!await ask('[2/6] Stage?')) { console.log('Aborted.'); process.exit(0); }
+  const t0 = Date.now();
+  cmdStage({ ...args, _: ['stage', latest] });
+  console.log(`[2/6] Staged ${latest} (${Math.round((Date.now() - t0) / 1000)}s)`);
+
+  // [3/6] Sandbox smoke test?
+  if (!await ask('[3/6] Sandbox smoke test?')) {
+    console.log('[3/6] Sandbox smoke test skipped.');
+  } else {
+    const { report } = await runSandboxTestCore({ ...args, _: ['sandbox-test', latest] }, latest);
+    const passed = report.passed, total = report.passed + report.failed;
+    console.log(`[3/6] Sandbox smoke test: ${passed}/${total} passed`);
+    if (report.failed) {
+      console.error(`Sandbox smoke test had ${report.failed} failure(s). Not promoting.`);
+      console.error(`Fix the issue or skip specific tests with --skip <ids> and re-run.`);
+      process.exit(1);
+    }
+  }
+
+  // [4/6] Promote?
+  if (!await ask('[4/6] Promote?')) {
+    console.log(`Aborted. ${latest} is staged — run: openclaw-update promote ${latest} --yes`);
+    process.exit(0);
+  }
+
+  await cmdPromote({ ...args, _: ['promote', latest], yes: true, stepBase: '4' });
+
+  console.log('[5/6] Promote successful.');
+  console.log(`[6/6] Previous version retained at ~/.openclaw/versions/${current}/. Rollback: openclaw-rollback`);
 }
 
 async function cmdUninstall(args) {
@@ -920,8 +993,9 @@ async function cmdUninstall(args) {
 
 async function main() {
   const args = parse(process.argv);
-  const cmd = args._[0] || 'status';
-  if (cmd === 'check') await cmdCheck(args);
+  const cmd = args._[0];
+  if (!cmd) await cmdInteractive(args);
+  else if (cmd === 'check') await cmdCheck(args);
   else if (cmd === 'status') cmdStatus(args);
   else if (cmd === 'stage') cmdStage(args);
   else if (cmd === 'sandbox-test') await cmdSandboxTest(args);
