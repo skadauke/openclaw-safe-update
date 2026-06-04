@@ -9,7 +9,8 @@ export default {
   timeout_ms: 10000,
   run(ctx) {
     const entry = resolve(ctx.installDir, 'openclaw.mjs');
-    const r = spawnSync('/opt/homebrew/bin/node', [entry, '--version'], { encoding: 'utf8', timeout: 5000 });
+    const nodeBin = process.env.OPENCLAW_NODE_BIN || '/opt/homebrew/bin/node';
+    const r = spawnSync(nodeBin, [entry, '--version'], { encoding: 'utf8', timeout: 5000 });
     if (r.status !== 0) return { ok: false, detail: `exit ${r.status}: ${(r.stderr || '').trim().slice(0, 200)}` };
     const v = (r.stdout || '').trim();
     const m = v.match(/(\d{4}\.\d+\.\d+)/);
