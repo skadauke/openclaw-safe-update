@@ -611,7 +611,7 @@ async function cmdPromote(args) {
   try {
     await platformRestartGateway(packageDir(version));
     if (args.stepBase) console.log(`[${args.stepBase}c/6]   Reloading launchd → kickstart ok`);
-    const report = await runSmoketest({ target: 'current', mode: 'quick', installDir: packageDir(version), configDir: OPENCLAW_DIR, port: 18789, models: args.withModels });
+    const report = await runSmoketest({ target: 'current', mode: 'quick', installDir: packageDir(version), configDir: OPENCLAW_DIR, port: 18789, telegram: args.telegram, models: args.withModels });
     smoketestReport = report;
     if (args.stepBase) {
       const total = report.passed + report.failed;
