@@ -49,6 +49,7 @@ All scripts respect these env vars for path discovery. Useful on non-standard in
 
 | Variable | Default | Description |
 |---|---|---|
+| `OPENCLAW_UPDATE_NODE_MIN` | `22.19.0` | Minimum Node.js version required to run these tools. If you point `OPENCLAW_NODE` at a custom Node.js binary that is older than this, the version guard in `bin/openclaw-update` will exit with a clear error. |
 | `OPENCLAW_NODE` | `process.execPath` | Path to the node binary |
 | `OPENCLAW_NPM` | sibling of node binary, then `which npm` | Path to the npm binary |
 | `OPENCLAW_INSTALL_DIR` | `npm root -g`/openclaw (verified via `openclaw.mjs`) | Path to the openclaw package directory (the dir containing `openclaw.mjs`) |

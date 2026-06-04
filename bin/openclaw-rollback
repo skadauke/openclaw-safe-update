@@ -20,8 +20,10 @@ FORENSICS_DIR="$SCRIPT_DIR/../forensics"
 SMOKETEST="$SCRIPT_DIR/openclaw-smoketest"
 NODE=/opt/homebrew/bin/node
 TS=$(date +%Y%m%dT%H%M%S)
-LAUNCHD_LABEL="ai.openclaw.gateway"
+PLATFORM=$(uname -s)
+LAUNCHD_LABEL="${OPENCLAW_LAUNCHD_LABEL:-ai.openclaw.gateway}"
 PLIST="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
+GW_CONTROL="$SCRIPT_DIR/../lib/gateway-control.mjs"
 
 # shellcheck source=../lib/state-snapshot.sh
 source "$SCRIPT_DIR/../lib/state-snapshot.sh"
@@ -29,17 +31,6 @@ source "$SCRIPT_DIR/../lib/state-snapshot.sh"
 die() { echo "ERROR: $*" >&2; exit 1; }
 log() { echo "[openclaw-rollback] $*"; }
 
-wait_port_free() {
-  local port="$1"
-  local max="${2:-30}"
-  local i=0
-  while [[ $i -lt $max ]]; do
-    if ! lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then return 0; fi
-    sleep 1
-    i=$((i + 1))
-  done
-  return 1
-}
 
 wait_healthz() {
   local port="${1:-18789}"
@@ -111,8 +102,8 @@ tail -500 "$OPENCLAW_DIR/logs/gateway.err.log" 2>/dev/null > "$FD/gateway.err.lo
 # Config snapshot
 cp "$OPENCLAW_DIR/openclaw.json" "$FD/openclaw.json.at-rollback" 2>/dev/null || true
 
-# Plist snapshot
-cp "$PLIST" "$FD/gateway.plist.at-rollback" 2>/dev/null || true
+# Plist snapshot (macOS only)
+[[ "$PLATFORM" == "Darwin" ]] && cp "$PLIST" "$FD/gateway.plist.at-rollback" 2>/dev/null || true
 
 # Manifest entry
 cat > "$FD/manifest.json" <<EOF
@@ -129,12 +120,22 @@ log "Forensics saved."
 
 # ── Stop the gateway ────────────────────────────────────────────────────────
 log "Stopping gateway..."
-launchctl bootout "gui/$(id -u)/$LAUNCHD_LABEL" 2>/dev/null || launchctl unload "$PLIST" 2>/dev/null || true
-if ! wait_port_free 18789 15; then
+"$NODE" "$GW_CONTROL" stop || true
+if ! "$NODE" "$GW_CONTROL" wait-port-free 18789 15; then
   log "  Port 18789 still held after 15s; force-killing remaining listener(s)..."
-  for pid in $(lsof -nP -iTCP:18789 -sTCP:LISTEN -t 2>/dev/null); do
-    kill -9 "$pid" 2>/dev/null || true
-  done
+  if [[ "$PLATFORM" == "Darwin" ]]; then
+    for pid in $(lsof -nP -iTCP:18789 -sTCP:LISTEN -t 2>/dev/null); do
+      kill -9 "$pid" 2>/dev/null || true
+    done
+  else
+    if command -v fuser >/dev/null 2>&1; then
+      fuser -k 18789/tcp 2>/dev/null || true
+    else
+      ss -tlnp 2>/dev/null | awk -F'pid=' '/:18789([ \t]|$)/{split($2,p,","); if(p[1]) print p[1]}' | while IFS= read -r pid; do
+        kill -9 "$pid" 2>/dev/null || true
+      done
+    fi
+  fi
   sleep 2
 fi
 
@@ -181,20 +182,22 @@ fi
 
 # ── Restart the gateway ─────────────────────────────────────────────────────
 log "Starting gateway..."
-if ! launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/tmp/launchctl-rollback-bootstrap.err; then
-  log "  launchctl bootstrap failed: $(cat /tmp/launchctl-rollback-bootstrap.err)"
-  log "  Trying legacy launchctl load..."
-  if ! launchctl load "$PLIST" 2>/dev/null; then
-    echo ""
-    echo "═══════════════════════════════════════════════════════════"
-    echo "  CRITICAL: Rollback failed to start gateway."
-    echo "  Gateway is NOT running. Manual recovery:"
+if ! "$NODE" "$GW_CONTROL" start; then
+  echo ""
+  echo "═══════════════════════════════════════════════════════════"
+  echo "  CRITICAL: Rollback failed to start gateway."
+  echo "  Gateway is NOT running. Manual recovery:"
+  if [[ "$PLATFORM" == "Darwin" ]]; then
     echo "    launchctl bootout gui/\$(id -u)/$LAUNCHD_LABEL 2>/dev/null"
     echo "    sleep 5"
     echo "    launchctl bootstrap gui/\$(id -u) $PLIST"
-    echo "═══════════════════════════════════════════════════════════"
-    exit 2
+  else
+    LINUX_UNIT="${OPENCLAW_SYSTEMD_UNIT:-openclaw-gateway}"
+    echo "    systemctl --user stop ${LINUX_UNIT}.service"
+    echo "    systemctl --user start ${LINUX_UNIT}.service"
   fi
+  echo "═══════════════════════════════════════════════════════════"
+  exit 2
 fi
 
 # Wait for gateway to actually respond before declaring success.
