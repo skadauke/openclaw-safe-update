@@ -94,9 +94,6 @@ const ERR_LOGS = [
 const GATEWAY_LABEL = 'ai.openclaw.gateway';
 const GATEWAY_PLIST = resolve(homedir(), `Library/LaunchAgents/${GATEWAY_LABEL}.plist`);
 const PORT = 18789;
-const DM_CHAT_ID = 8290418965;
-const ALERT_BUS_TG = resolve(homedir(), 'clawd/moby-os/intelligence/alert-bus/lib/telegram-post.mjs');
-
 const FATAL_PATTERNS = [
   /Gateway failed to start/i,
   /Invalid config/i,
@@ -109,13 +106,17 @@ const FATAL_PATTERNS = [
 const FATAL_REPEAT_THRESHOLD = 2;
 
 async function notify(text) {
+  const cmd = process.env.OPENCLAW_UPDATE_NOTIFY_CMD;
+  if (!cmd) {
+    process.stderr.write(`[safe-doctor-fix] ${text}\n`);
+    return;
+  }
   try {
-    const { sendMessage } = await import(ALERT_BUS_TG);
-    const r = await sendMessage({ chat_id: DM_CHAT_ID, thread_id: null, text });
-    if (r.ok) console.log(`  → telegram: posted (message_id=${r.message_id})`);
-    else console.log(`  → telegram: failed (${r.reason})`);
+    const payload = JSON.stringify({ source: 'safe-doctor-fix', message: text, timestamp: new Date().toISOString() });
+    const r = spawnSync('sh', ['-c', cmd], { input: payload, encoding: 'utf8', timeout: 10000 });
+    if (r.status !== 0) process.stderr.write(`[notify] command failed (non-fatal): ${(r.stderr || r.stdout || '').trim().slice(0, 200)}\n`);
   } catch (err) {
-    console.log(`  → telegram: skipped (${err.message})`);
+    process.stderr.write(`[notify] skipped (non-fatal): ${err.message}\n`);
   }
 }
 

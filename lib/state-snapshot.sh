@@ -11,6 +11,12 @@ OPENCLAW_DIR_DEFAULT="$HOME/.openclaw"
 RESILIENCE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WHITELIST_FILE="$RESILIENCE_ROOT/snapshot-whitelist.txt"
 
+if command -v sha256sum >/dev/null 2>&1; then
+  SHA256=(sha256sum)
+else
+  SHA256=(shasum -a 256)
+fi
+
 # Print whitelist entries (skipping comments and blank lines)
 _whitelist_entries() {
   [[ -f "$WHITELIST_FILE" ]] || { echo "snapshot whitelist not found: $WHITELIST_FILE" >&2; return 1; }
@@ -42,7 +48,7 @@ snapshot_state() {
     if [[ -f "$src" ]]; then
       mkdir -p "$(dirname "$dest")"
       cp -p "$src" "$dest"
-      sha=$(shasum -a 256 "$src" | awk '{print $1}')
+      sha=$("${SHA256[@]}" "$src" | awk '{print $1}')
       [[ $first -eq 1 ]] || echo "," >> "$manifest_tmp"
       printf '    "%s": "%s"' "$entry" "$sha" >> "$manifest_tmp"
       first=0
@@ -111,8 +117,8 @@ diff_state() {
     [[ -z "$entry" ]] && continue
     [[ -f "$openclaw_dir/$entry" ]] || { echo "  - missing (live): $entry"; continue; }
     [[ -f "$snap_dir/$entry" ]] || { echo "  - missing (snap): $entry"; continue; }
-    live_sha=$(shasum -a 256 "$openclaw_dir/$entry" | awk '{print $1}')
-    snap_sha=$(shasum -a 256 "$snap_dir/$entry" | awk '{print $1}')
+    live_sha=$("${SHA256[@]}" "$openclaw_dir/$entry" | awk '{print $1}')
+    snap_sha=$("${SHA256[@]}" "$snap_dir/$entry" | awk '{print $1}')
     if [[ "$live_sha" != "$snap_sha" ]]; then
       echo "  ≠ drift: $entry  (live=$live_sha snap=$snap_sha)"
     fi
