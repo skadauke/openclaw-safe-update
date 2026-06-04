@@ -46,9 +46,13 @@ Commands:
                                  --skip 04,11 to skip specific test ids during the post-promote smoketest.
   rollback                       Run the one-command rollback helper
   cleanup --yes [--keep N]       Remove old staged versions; never deletes current/previous/broken
+  uninstall --yes [--remove-versions]
+                                 Restore system openclaw, remove openclaw-update tools, restart gateway, smoketest.
+                                 Default: keep ~/.openclaw/versions/ (printed reminder to delete in 30 days).
+                                 --remove-versions: also delete ~/.openclaw/versions/.
 
 Safety:
-  migrate-to-versioned.sh performs the one-time switchover. Promote/cleanup require --yes.
+  migrate-to-versioned.sh performs the one-time switchover. Promote/cleanup/uninstall require --yes.
   This CLI never changes ~/.openclaw state for check/status/smoketest.
 
 Environment overrides:
@@ -58,7 +62,7 @@ Environment overrides:
 }
 
 function parse(argv) {
-  const args = { _: [], json: false, yes: false, dryRun: false, quick: false, keep: 3, telegram: true, withModels: false, interpret: false, port: 18790, bonjourWatchSec: 120, verbose: false, skip: [], configSource: null };
+  const args = { _: [], json: false, yes: false, dryRun: false, quick: false, keep: 3, telegram: true, withModels: false, interpret: false, port: 18790, bonjourWatchSec: 120, verbose: false, skip: [], configSource: null, removeVersions: false };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--json') args.json = true;
@@ -75,6 +79,8 @@ function parse(argv) {
     else if (a === '--verbose') args.verbose = true;
     else if (a === '--interpret') args.interpret = true;
     else if (a === '--keep') args.keep = Number(argv[++i]);
+    else if (a === '--remove-versions') args.removeVersions = true;
+    else if (a === '--keep-versions') args.removeVersions = false;
     else if (a === '-h' || a === '--help') { usage(); process.exit(0); }
     else args._.push(a);
   }
@@ -460,7 +466,6 @@ async function cmdSmoketest(args) {
   process.exit(report.failed ? 1 : 0);
 }
 
-
 function snapshotState(versionDirPath) {
   const r = spawnSync('bash', ['-c', `source "${SNAPSHOT_HELPER}" && snapshot_state "${versionDirPath}"`], { encoding: 'utf8', timeout: 30000 });
   if (r.status !== 0) throw new Error(`state snapshot failed: ${(r.stderr || r.stdout || '').trim()}`);
@@ -624,6 +629,269 @@ function cmdCleanup(args) {
   if (!args.dryRun) addEvent({ event: 'cleanup', removed: remove });
 }
 
+async function cmdUninstall(args) {
+  if (!args.yes && !args.dryRun) throw new Error('uninstall requires --yes (or --dry-run)');
+  if (!args.dryRun) installTranscript('uninstall');
+
+  const BREW_BIN = '/opt/homebrew/bin/openclaw';
+  const STUB_FINGERPRINT = 'openclaw is managed by openclaw-update';
+  const UPDATE_TOOLS = ['openclaw-update', 'openclaw-rollback', 'openclaw-smoketest'];
+
+  function tryLstat(p) { try { return lstatSync(p); } catch { return null; } }
+
+  // Step 1 — Verify gateway is healthy before touching anything
+  console.log('Step 1 — Verifying gateway is healthy...');
+  const healthR = spawnSync('curl', ['-sf', '--max-time', '5', 'http://127.0.0.1:18789/healthz'], { encoding: 'utf8', timeout: 10000 });
+  if (healthR.status !== 0 || !(healthR.stdout || '').includes('"ok":true')) {
+    throw new Error(
+      'Gateway is not healthy; uninstalling now would leave it broken.\n' +
+      '  Diagnose: openclaw-update status\n' +
+      '  Repair:   openclaw-rollback'
+    );
+  }
+  console.log('  ✓ Gateway healthy.');
+
+  // Verify current/previous symlinks point to real version directories (if migrated)
+  const currentLst = tryLstat(CURRENT_LINK);
+  const isMigrated = currentLst?.isSymbolicLink() ?? false;
+  if (isMigrated) {
+    const currentTarget = readlink(CURRENT_LINK);
+    if (!currentTarget || !existsSync(currentTarget)) {
+      throw new Error(
+        'The ~/.openclaw/current symlink is dangling — the target directory does not exist.\n' +
+        '  Diagnose: openclaw-update status'
+      );
+    }
+    const pkgNpm = resolve(currentTarget, 'node_modules/openclaw/package.json');
+    const pkgLegacy = resolve(currentTarget, 'lib/node_modules/openclaw/package.json');
+    if (!existsSync(pkgNpm) && !existsSync(pkgLegacy)) {
+      throw new Error(
+        `~/.openclaw/current points to ${currentTarget} but no openclaw package found there.\n` +
+        '  Diagnose: openclaw-update status'
+      );
+    }
+    const prevLst = tryLstat(PREVIOUS_LINK);
+    const prevTarget = prevLst?.isSymbolicLink() ? readlink(PREVIOUS_LINK) : null;
+    if (!prevTarget || !existsSync(prevTarget)) {
+      console.log('  ⚠ ~/.openclaw/previous is missing or dangling — no automated rollback if uninstall encounters issues.');
+    } else {
+      console.log('  ✓ Symlinks healthy: current and previous both resolve.');
+    }
+  }
+
+  // Step 2 — Locate the system (pre-migration) openclaw package
+  console.log('Step 2 — Locating system openclaw install...');
+  let systemInstallDir = BREW_INSTALL; // /opt/homebrew/lib/node_modules/openclaw on macOS
+  if (process.platform !== 'darwin') {
+    const npmRootR = run('npm', ['root', '-g'], { timeout: 15000 });
+    if (npmRootR.status !== 0) throw new Error(`Cannot determine npm global root: ${npmRootR.stderr || npmRootR.stdout}`);
+    systemInstallDir = resolve(npmRootR.stdout.trim(), 'openclaw');
+  }
+  const systemPkg = resolve(systemInstallDir, 'package.json');
+  if (!existsSync(systemPkg)) {
+    throw new Error(
+      `System openclaw not found at ${systemInstallDir}.\n` +
+      `  It was removed during migration (npm uninstall -g openclaw).\n` +
+      `  Re-install it first, then re-run:\n` +
+      `    npm install -g openclaw\n` +
+      `    openclaw-update uninstall --yes`
+    );
+  }
+  const systemEntry = resolve(systemInstallDir, 'dist/index.js');
+  if (!existsSync(systemEntry)) {
+    throw new Error(
+      `System openclaw at ${systemInstallDir} is missing dist/index.js.\n` +
+      `  The install may be corrupt. Try: npm install -g openclaw`
+    );
+  }
+  let systemVersion = null;
+  try { systemVersion = JSON.parse(readFileSync(systemPkg, 'utf8')).version; } catch {}
+  console.log(`  ✓ Found system openclaw${systemVersion ? ` ${systemVersion}` : ''} at ${systemInstallDir}`);
+
+  // Step 3 — Restore launchd plist (macOS) or systemd unit (Linux) to system openclaw path
+  const versionedEntry = `${homedir()}/.openclaw/current/lib/node_modules/openclaw/dist/index.js`;
+  if (process.platform === 'darwin') {
+    console.log('Step 3 — Restoring launchd plist to system openclaw path...');
+    if (!existsSync(GATEWAY_PLIST)) throw new Error(`Gateway plist not found at ${GATEWAY_PLIST}`);
+    const plistContent = readFileSync(GATEWAY_PLIST, 'utf8');
+    if (!plistContent.includes(versionedEntry)) {
+      if (plistContent.includes(systemEntry)) {
+        console.log('  · Plist already points at system path — no change needed.');
+      } else {
+        throw new Error(
+          `Cannot identify the managed plist entry to restore.\n` +
+          `  Expected to find: ${versionedEntry}\n` +
+          `  In plist: ${GATEWAY_PLIST}\n` +
+          `  The plist may have been manually edited. Inspect and restore it manually.`
+        );
+      }
+    } else if (args.dryRun) {
+      console.log(`  [dry-run] would update plist:\n    ${versionedEntry}\n    → ${systemEntry}`);
+    } else {
+      const TS = new Date().toISOString().replace(/[:.]/g, '-');
+      const plistBackup = `${GATEWAY_PLIST}.pre-uninstall-${TS}`;
+      cpSync(GATEWAY_PLIST, plistBackup, { force: true });
+      console.log(`  Backed up plist to ${plistBackup}`);
+      writeFileSync(GATEWAY_PLIST, plistContent.replaceAll(versionedEntry, systemEntry));
+      console.log(`  ✓ Plist updated → ${systemEntry}`);
+    }
+  } else {
+    console.log('Step 3 — Restoring systemd unit to system openclaw path...');
+    const userUnitPath = resolve(homedir(), `.config/systemd/user/${GATEWAY_LABEL}.service`);
+    const systemUnitPath = `/etc/systemd/system/${GATEWAY_LABEL}.service`;
+    const unitPath = existsSync(userUnitPath) ? userUnitPath : existsSync(systemUnitPath) ? systemUnitPath : null;
+    if (!unitPath) {
+      console.log('  · No systemd unit found — skipping unit file update.');
+      console.log(`    (Looked for: ${userUnitPath}  and  ${systemUnitPath})`);
+    } else {
+      const unitContent = readFileSync(unitPath, 'utf8');
+      if (!unitContent.includes(versionedEntry)) {
+        if (unitContent.includes(systemEntry)) {
+          console.log('  · Systemd unit already points at system path — no change needed.');
+        } else {
+          console.log(`  ⚠ Could not identify managed entry in ${unitPath} — inspect and update ExecStart manually.`);
+        }
+      } else if (args.dryRun) {
+        console.log(`  [dry-run] would update ${unitPath}:\n    ${versionedEntry}\n    → ${systemEntry}`);
+      } else {
+        const TS = new Date().toISOString().replace(/[:.]/g, '-');
+        cpSync(unitPath, `${unitPath}.pre-uninstall-${TS}`, { force: true });
+        writeFileSync(unitPath, unitContent.replaceAll(versionedEntry, systemEntry));
+        const scope = unitPath.startsWith(homedir()) ? ['--user'] : [];
+        spawnSync('systemctl', [...scope, 'daemon-reload'], { encoding: 'utf8', timeout: 10000 });
+        console.log(`  ✓ Systemd unit updated → ${systemEntry}`);
+      }
+    }
+  }
+
+  // Step 4 — Remove managed stub at /opt/homebrew/bin/openclaw if still present
+  console.log('Step 4 — Restoring /opt/homebrew/bin/openclaw...');
+  const brewBinSt = tryLstat(BREW_BIN);
+  if (brewBinSt) {
+    let isStub = false;
+    try { isStub = !brewBinSt.isSymbolicLink() && readFileSync(BREW_BIN, 'utf8').includes(STUB_FINGERPRINT); } catch {}
+    if (isStub) {
+      if (args.dryRun) {
+        console.log(`  [dry-run] would remove stub and restore symlink at ${BREW_BIN}`);
+      } else {
+        unlinkSync(BREW_BIN);
+        // npm install -g openclaw should have recreated the symlink. If the stub was
+        // not overwritten by npm (edge case), recreate the symlink ourselves.
+        if (!tryLstat(BREW_BIN)) {
+          const mjs = resolve(systemInstallDir, 'openclaw.mjs');
+          if (existsSync(mjs)) {
+            symlinkSync('../lib/node_modules/openclaw/openclaw.mjs', BREW_BIN);
+            console.log(`  ✓ Restored symlink at ${BREW_BIN}`);
+          } else {
+            console.log(`  ✓ Removed stub at ${BREW_BIN} (run: npm install -g openclaw to restore the symlink)`);
+          }
+        } else {
+          console.log(`  ✓ Removed stub at ${BREW_BIN}`);
+        }
+      }
+    } else {
+      console.log('  · Brew binary is not the managed stub — skipping.');
+    }
+  } else {
+    console.log('  · /opt/homebrew/bin/openclaw not present — skipping.');
+  }
+
+  // Step 5 — Remove update tools from ~/.openclaw/bin/
+  console.log('Step 5 — Removing openclaw-update tools from ~/.openclaw/bin/...');
+  const binDir = resolve(OPENCLAW_DIR, 'bin');
+  for (const tool of UPDATE_TOOLS) {
+    const p = resolve(binDir, tool);
+    const st = tryLstat(p);
+    if (!st) { console.log(`  · ${tool} not found — skipping.`); continue; }
+    if (args.dryRun) { console.log(`  [dry-run] would remove ${p}`); continue; }
+    try {
+      if (st.isSymbolicLink()) unlinkSync(p);
+      else rmSync(p, { recursive: true, force: true });
+      console.log(`  ✓ removed ${p}`);
+    } catch (err) {
+      console.log(`  ⚠ could not remove ${p}: ${err.message} (non-fatal, remove manually)`);
+    }
+  }
+
+  // Step 6 — Optionally remove ~/.openclaw/versions/; default is keep
+  console.log('Step 6 — Managing ~/.openclaw/versions/...');
+  if (args.removeVersions) {
+    if (args.dryRun) {
+      console.log(`  [dry-run] would remove ${VERSIONS_DIR}`);
+      console.log(`  [dry-run] would remove dangling symlinks: ${CURRENT_LINK}, ${PREVIOUS_LINK}`);
+      console.log(`  [dry-run] would remove ${resolve(OPENCLAW_DIR, 'bin/openclaw')} wrapper`);
+    } else if (existsSync(VERSIONS_DIR)) {
+      rmSync(VERSIONS_DIR, { recursive: true, force: true });
+      console.log(`  ✓ Removed ${VERSIONS_DIR}`);
+      // current/previous symlinks are now dangling — remove them
+      for (const link of [CURRENT_LINK, PREVIOUS_LINK]) {
+        if (tryLstat(link)?.isSymbolicLink()) {
+          try { unlinkSync(link); console.log(`  ✓ Removed dangling symlink: ${link}`); }
+          catch (err) { console.log(`  ⚠ Could not remove ${link}: ${err.message}`); }
+        }
+      }
+      // The ~/.openclaw/bin/openclaw wrapper now points at a deleted current/ target — remove it
+      const openclawWrapper = resolve(OPENCLAW_DIR, 'bin/openclaw');
+      if (tryLstat(openclawWrapper)) {
+        try { unlinkSync(openclawWrapper); console.log(`  ✓ Removed ${openclawWrapper}`); }
+        catch (err) { console.log(`  ⚠ Could not remove ${openclawWrapper}: ${err.message} (remove manually)`); }
+      }
+      console.log(`  To remove ~/.openclaw/bin from PATH, edit ~/.zshrc and delete the line:`);
+      console.log(`    export PATH="$HOME/.openclaw/bin:$PATH"`);
+    } else {
+      console.log('  · versions/ directory already gone — skipping.');
+    }
+  } else {
+    if (existsSync(VERSIONS_DIR)) {
+      console.log(`  Keeping ${VERSIONS_DIR} (default).`);
+      console.log(`  To delete later:  rm -rf ${VERSIONS_DIR}`);
+      const openclawWrapper = resolve(OPENCLAW_DIR, 'bin/openclaw');
+      if (tryLstat(openclawWrapper)) {
+        console.log(`  ⚠ ${openclawWrapper} still exists and ~/.openclaw/bin may be in your PATH.`);
+        console.log(`    The 'openclaw' shell command will continue to invoke the managed version`);
+        console.log(`    while the gateway now runs the system version — these may differ.`);
+        console.log(`    To avoid confusion, remove the wrapper and update your PATH:`);
+        console.log(`      rm ${openclawWrapper}`);
+        console.log(`    Then edit ~/.zshrc (or ~/.bashrc) to remove the line:`);
+        console.log(`      export PATH="$HOME/.openclaw/bin:$PATH"`);
+      }
+    }
+  }
+
+  if (args.dryRun) {
+    console.log('\n[dry-run] No changes were made.');
+    return;
+  }
+
+  // Step 7 — Restart gateway; plist now points at the system install
+  console.log('Step 7 — Restarting gateway (plist now points at system openclaw)...');
+  await platformRestartGateway(systemInstallDir);
+  console.log('  ✓ Gateway restarted.');
+
+  // Step 8 — Smoketest the reverted setup
+  console.log('Step 8 — Verifying reverted setup...');
+  const report = await runSmoketest({
+    target: 'current',
+    mode: 'quick',
+    installDir: systemInstallDir,
+    configDir: OPENCLAW_DIR,
+    port: 18789,
+    telegram: args.telegram,
+    models: false,
+    skip: args.skip,
+  });
+  console.log(formatTextReport(report));
+  if (report.failed) throw new Error('Post-uninstall smoketest failed. Gateway may need manual attention.');
+
+  addEvent({ event: 'uninstall', systemInstallDir, removedVersions: args.removeVersions });
+
+  console.log('\nUninstall complete. The gateway is now running the system openclaw.');
+  if (!args.removeVersions && existsSync(VERSIONS_DIR)) {
+    console.log(`Staged versions remain in ${VERSIONS_DIR}.`);
+    console.log(`Delete in ~30 days with:  rm -rf ${VERSIONS_DIR}`);
+  }
+}
+
 async function main() {
   const args = parse(process.argv);
   const cmd = args._[0] || 'status';
@@ -635,6 +903,7 @@ async function main() {
   else if (cmd === 'promote') await cmdPromote(args);
   else if (cmd === 'rollback') cmdRollback(args);
   else if (cmd === 'cleanup') cmdCleanup(args);
+  else if (cmd === 'uninstall') await cmdUninstall(args);
   else { usage(); process.exit(64); }
 }
 
