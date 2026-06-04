@@ -5,8 +5,6 @@
 import { spawnSync, spawn } from 'node:child_process';
 import { resolve } from 'node:path';
 
-const NODE = '/opt/homebrew/bin/node';
-
 function normalizeServers(parsed) {
   if (Array.isArray(parsed)) return parsed;
   if (parsed && typeof parsed === 'object') {
@@ -183,6 +181,7 @@ export default {
   timeout_ms: 30000,
   async run(ctx) {
     const cli = resolve(ctx.installDir, 'openclaw.mjs');
+    const nodeBin = process.env.OPENCLAW_NODE_BIN || '/opt/homebrew/bin/node';
     const env = {
       ...process.env,
       OPENCLAW_HOME: ctx.configDir,
@@ -191,7 +190,7 @@ export default {
     };
 
     // Phase 1: shallow pre-check (fast fail if CLI surface is broken)
-    const r = spawnSync(NODE, [cli, 'mcp', 'list', '--json'], { encoding: 'utf8', env, timeout: 8000 });
+    const r = spawnSync(nodeBin, [cli, 'mcp', 'list', '--json'], { encoding: 'utf8', env, timeout: 8000 });
     if (r.status !== 0) {
       return { ok: false, detail: `openclaw mcp list failed: ${(r.stderr || r.stdout).slice(0, 200)}` };
     }

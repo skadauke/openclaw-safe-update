@@ -12,7 +12,8 @@ export default {
   timeout_ms: 20000,
   run(ctx) {
     const cli = resolve(ctx.installDir, 'openclaw.mjs');
-    const r = spawnSync('/opt/homebrew/bin/node', [cli, 'skills', 'list', '--json'], {
+    const nodeBin = process.env.OPENCLAW_NODE_BIN || '/opt/homebrew/bin/node';
+    const r = spawnSync(nodeBin, [cli, 'skills', 'list', '--json'], {
       encoding: 'utf8',
       env: { ...process.env, OPENCLAW_HOME: ctx.configDir, OPENCLAW_CONFIG_PATH: resolve(ctx.configDir, 'openclaw.json'), OPENCLAW_GATEWAY_PORT: String(ctx.port) },
       timeout: 15000 });

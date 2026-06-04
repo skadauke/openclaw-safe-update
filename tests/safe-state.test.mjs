@@ -17,6 +17,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const REAL_RESILIENCE = resolve(HERE, '..');
 const REAL_SAFE_STATE = resolve(REAL_RESILIENCE, 'bin/safe-state');
 const REAL_EXCLUDES = resolve(REAL_RESILIENCE, 'state-repo.gitignore');
+const FIXTURE_OPENCLAW_DIR = resolve(HERE, 'fixtures/mock-openclaw-dir');
 
 const verbose = process.argv.includes('--verbose');
 const results = [];
@@ -29,7 +30,9 @@ function setup() {
   const home = resolve(root, 'home');
   const openclawDir = resolve(home, '.openclaw');
   const clawdResilience = resolve(home, 'clawd/clawd-resilience/openclaw-update');
-  mkdirSync(openclawDir, { recursive: true });
+  // Seed from shared fixture dir so individual tests don't need to recreate
+  // the base openclaw directory structure from scratch.
+  cpSync(FIXTURE_OPENCLAW_DIR, openclawDir, { recursive: true });
   mkdirSync(resolve(clawdResilience, 'bin'), { recursive: true });
   // Copy the real binary + excludes into the fake tree so paths resolve there
   cpSync(REAL_SAFE_STATE, resolve(clawdResilience, 'bin/safe-state'));

@@ -90,7 +90,8 @@ export default {
       env.OPENCLAW_HOME = ctx.configDir;
       env.OPENCLAW_CONFIG_PATH = cfgPath;
     }
-    const r = spawnSync('/opt/homebrew/bin/node', [
+    const nodeBin = process.env.OPENCLAW_NODE_BIN || '/opt/homebrew/bin/node';
+    const r = spawnSync(nodeBin, [
       existsSync(entry) ? entry : resolve(ctx.installDir, 'dist/index.js'),
       'doctor',
     ], { encoding: 'utf8', timeout: 30000, env });
