@@ -116,7 +116,59 @@ cat > "$FD/manifest.json" <<EOF
   "reason": "manual"
 }
 EOF
+# Config diff: live openclaw.json vs previous version's state-snapshot
+PREV_SNAPSHOT="$PREVIOUS_TARGET/.state-snapshot/openclaw.json"
+if [[ -f "$OPENCLAW_DIR/openclaw.json" && -f "$PREV_SNAPSHOT" ]]; then
+  diff -u "$PREV_SNAPSHOT" "$OPENCLAW_DIR/openclaw.json" > "$FD/diff-config.txt" 2>&1 || true
+  [[ -s "$FD/diff-config.txt" ]] || echo "(configs are identical)" > "$FD/diff-config.txt"
+else
+  printf "No state snapshot for %s — cannot diff config.\n(Expected: %s)\n" "$PREV_VER" "$PREV_SNAPSHOT" > "$FD/diff-config.txt"
+fi
+
+# Package diff: npm changes between versions (max 5000 chars)
+NPM=/opt/homebrew/bin/npm
+if [[ -x "$NPM" ]]; then
+  "$NPM" diff --diff="openclaw@${PREV_VER}" --diff="openclaw@${CURRENT_VER}" 2>&1 \
+    | head -c 5000 > "$FD/diff-pkg.txt" || true
+fi
+if [[ ! -s "$FD/diff-pkg.txt" ]]; then
+  {
+    echo "npm diff unavailable or failed; package.json version fields:"
+    echo ""
+    PREV_PKG="$PREVIOUS_TARGET/node_modules/openclaw/package.json"
+    [[ -f "$PREV_PKG" ]] || PREV_PKG="$PREVIOUS_TARGET/lib/node_modules/openclaw/package.json"
+    CUR_PKG="$CURRENT_TARGET/node_modules/openclaw/package.json"
+    [[ -f "$CUR_PKG" ]] || CUR_PKG="$CURRENT_TARGET/lib/node_modules/openclaw/package.json"
+    echo "--- openclaw@${PREV_VER}"
+    python3 -c "import json,sys; p=json.load(open(sys.argv[1])); print('version:', p['version'])" "$PREV_PKG" 2>/dev/null || echo "  (package.json not found)"
+    echo "+++ openclaw@${CURRENT_VER}"
+    python3 -c "import json,sys; p=json.load(open(sys.argv[1])); print('version:', p['version'])" "$CUR_PKG" 2>/dev/null || echo "  (package.json not found)"
+  } > "$FD/diff-pkg.txt"
+fi
+
+# Env dump from gateway plist (values >30 chars with no spaces masked as ***)
+if [[ -f "$PLIST" ]]; then
+  python3 - "$PLIST" > "$FD/env-dump.txt" 2>/dev/null <<'PYEOF' || true
+import sys, plistlib
+with open(sys.argv[1], 'rb') as f:
+    plist = plistlib.load(f)
+for key, val in sorted(plist.get('EnvironmentVariables', {}).items()):
+    val = str(val)
+    print(key + '=' + ('***' if len(val) > 30 and ' ' not in val else val))
+PYEOF
+  [[ -s "$FD/env-dump.txt" ]] || echo "(no environment variables found in plist)" > "$FD/env-dump.txt"
+else
+  echo "Plist not found: $PLIST" > "$FD/env-dump.txt"
+fi
 log "Forensics saved."
+
+# Smoketest result: from auto-rollback env var if set, else run live before stopping gateway
+if [[ -n "${OPENCLAW_SMOKETEST_RESULT_FILE:-}" && -f "$OPENCLAW_SMOKETEST_RESULT_FILE" ]]; then
+  cp "$OPENCLAW_SMOKETEST_RESULT_FILE" "$FD/smoketest-result.json" 2>/dev/null || true
+elif [[ -x "$SMOKETEST" ]]; then
+  log "Running pre-rollback smoketest to document gateway state..."
+  "$NODE" "$SMOKETEST" --quick --json > "$FD/smoketest-result.json" 2>/dev/null || true
+fi
 
 # ── Stop the gateway ────────────────────────────────────────────────────────
 log "Stopping gateway..."
