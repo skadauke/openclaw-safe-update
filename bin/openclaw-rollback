@@ -14,14 +14,16 @@
 set -euo pipefail
 
 OPENCLAW_DIR="$HOME/.openclaw"
-CLAWD_DIR="$HOME/clawd"
+CLAWD_DIR="${OPENCLAW_UPDATE_WORKSPACE_GIT:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FORENSICS_DIR="$SCRIPT_DIR/../forensics"
 SMOKETEST="$SCRIPT_DIR/openclaw-smoketest"
 NODE=/opt/homebrew/bin/node
 TS=$(date +%Y%m%dT%H%M%S)
-LAUNCHD_LABEL="ai.openclaw.gateway"
+PLATFORM=$(uname -s)
+LAUNCHD_LABEL="${OPENCLAW_LAUNCHD_LABEL:-ai.openclaw.gateway}"
 PLIST="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
+GW_CONTROL="$SCRIPT_DIR/../lib/gateway-control.mjs"
 
 # shellcheck source=../lib/state-snapshot.sh
 source "$SCRIPT_DIR/../lib/state-snapshot.sh"
@@ -29,17 +31,6 @@ source "$SCRIPT_DIR/../lib/state-snapshot.sh"
 die() { echo "ERROR: $*" >&2; exit 1; }
 log() { echo "[openclaw-rollback] $*"; }
 
-wait_port_free() {
-  local port="$1"
-  local max="${2:-30}"
-  local i=0
-  while [[ $i -lt $max ]]; do
-    if ! lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then return 0; fi
-    sleep 1
-    i=$((i + 1))
-  done
-  return 1
-}
 
 wait_healthz() {
   local port="${1:-18789}"
@@ -111,8 +102,8 @@ tail -500 "$OPENCLAW_DIR/logs/gateway.err.log" 2>/dev/null > "$FD/gateway.err.lo
 # Config snapshot
 cp "$OPENCLAW_DIR/openclaw.json" "$FD/openclaw.json.at-rollback" 2>/dev/null || true
 
-# Plist snapshot
-cp "$PLIST" "$FD/gateway.plist.at-rollback" 2>/dev/null || true
+# Plist snapshot (macOS only)
+[[ "$PLATFORM" == "Darwin" ]] && cp "$PLIST" "$FD/gateway.plist.at-rollback" 2>/dev/null || true
 
 # Manifest entry
 cat > "$FD/manifest.json" <<EOF
@@ -125,16 +116,78 @@ cat > "$FD/manifest.json" <<EOF
   "reason": "manual"
 }
 EOF
+# Config diff: live openclaw.json vs previous version's state-snapshot
+PREV_SNAPSHOT="$PREVIOUS_TARGET/.state-snapshot/openclaw.json"
+if [[ -f "$OPENCLAW_DIR/openclaw.json" && -f "$PREV_SNAPSHOT" ]]; then
+  diff -u "$PREV_SNAPSHOT" "$OPENCLAW_DIR/openclaw.json" > "$FD/diff-config.txt" 2>&1 || true
+  [[ -s "$FD/diff-config.txt" ]] || echo "(configs are identical)" > "$FD/diff-config.txt"
+else
+  printf "No state snapshot for %s — cannot diff config.\n(Expected: %s)\n" "$PREV_VER" "$PREV_SNAPSHOT" > "$FD/diff-config.txt"
+fi
+
+# Package diff: npm changes between versions (max 5000 chars)
+NPM=/opt/homebrew/bin/npm
+if [[ -x "$NPM" ]]; then
+  "$NPM" diff --diff="openclaw@${PREV_VER}" --diff="openclaw@${CURRENT_VER}" 2>&1 \
+    | head -c 5000 > "$FD/diff-pkg.txt" || true
+fi
+if [[ ! -s "$FD/diff-pkg.txt" ]]; then
+  {
+    echo "npm diff unavailable or failed; package.json version fields:"
+    echo ""
+    PREV_PKG="$PREVIOUS_TARGET/node_modules/openclaw/package.json"
+    [[ -f "$PREV_PKG" ]] || PREV_PKG="$PREVIOUS_TARGET/lib/node_modules/openclaw/package.json"
+    CUR_PKG="$CURRENT_TARGET/node_modules/openclaw/package.json"
+    [[ -f "$CUR_PKG" ]] || CUR_PKG="$CURRENT_TARGET/lib/node_modules/openclaw/package.json"
+    echo "--- openclaw@${PREV_VER}"
+    python3 -c "import json,sys; p=json.load(open(sys.argv[1])); print('version:', p['version'])" "$PREV_PKG" 2>/dev/null || echo "  (package.json not found)"
+    echo "+++ openclaw@${CURRENT_VER}"
+    python3 -c "import json,sys; p=json.load(open(sys.argv[1])); print('version:', p['version'])" "$CUR_PKG" 2>/dev/null || echo "  (package.json not found)"
+  } > "$FD/diff-pkg.txt"
+fi
+
+# Env dump from gateway plist (values >30 chars with no spaces masked as ***)
+if [[ -f "$PLIST" ]]; then
+  python3 - "$PLIST" > "$FD/env-dump.txt" 2>/dev/null <<'PYEOF' || true
+import sys, plistlib
+with open(sys.argv[1], 'rb') as f:
+    plist = plistlib.load(f)
+for key, val in sorted(plist.get('EnvironmentVariables', {}).items()):
+    val = str(val)
+    print(key + '=' + ('***' if len(val) > 30 and ' ' not in val else val))
+PYEOF
+  [[ -s "$FD/env-dump.txt" ]] || echo "(no environment variables found in plist)" > "$FD/env-dump.txt"
+else
+  echo "Plist not found: $PLIST" > "$FD/env-dump.txt"
+fi
 log "Forensics saved."
+
+# Smoketest result: from auto-rollback env var if set, else run live before stopping gateway
+if [[ -n "${OPENCLAW_SMOKETEST_RESULT_FILE:-}" && -f "$OPENCLAW_SMOKETEST_RESULT_FILE" ]]; then
+  cp "$OPENCLAW_SMOKETEST_RESULT_FILE" "$FD/smoketest-result.json" 2>/dev/null || true
+elif [[ -x "$SMOKETEST" ]]; then
+  log "Running pre-rollback smoketest to document gateway state..."
+  "$NODE" "$SMOKETEST" --quick --json > "$FD/smoketest-result.json" 2>/dev/null || true
+fi
 
 # ── Stop the gateway ────────────────────────────────────────────────────────
 log "Stopping gateway..."
-launchctl bootout "gui/$(id -u)/$LAUNCHD_LABEL" 2>/dev/null || launchctl unload "$PLIST" 2>/dev/null || true
-if ! wait_port_free 18789 15; then
+"$NODE" "$GW_CONTROL" stop || true
+if ! "$NODE" "$GW_CONTROL" wait-port-free 18789 15; then
   log "  Port 18789 still held after 15s; force-killing remaining listener(s)..."
-  for pid in $(lsof -nP -iTCP:18789 -sTCP:LISTEN -t 2>/dev/null); do
-    kill -9 "$pid" 2>/dev/null || true
-  done
+  if [[ "$PLATFORM" == "Darwin" ]]; then
+    for pid in $(lsof -nP -iTCP:18789 -sTCP:LISTEN -t 2>/dev/null); do
+      kill -9 "$pid" 2>/dev/null || true
+    done
+  else
+    if command -v fuser >/dev/null 2>&1; then
+      fuser -k 18789/tcp 2>/dev/null || true
+    else
+      ss -tlnp 2>/dev/null | awk -F'pid=' '/:18789([ \t]|$)/{split($2,p,","); if(p[1]) print p[1]}' | while IFS= read -r pid; do
+        kill -9 "$pid" 2>/dev/null || true
+      done
+    fi
+  fi
   sleep 2
 fi
 
@@ -164,14 +217,14 @@ if [[ -d "$CURRENT_TARGET" && ! -d "$BROKEN_DIR" ]]; then
   log "Broken version moved to: $BROKEN_DIR"
 fi
 
-# ── Report ~/clawd git drift since the most recent pre-update tag ───────────
-if command -v git >/dev/null 2>&1 && [[ -d "$CLAWD_DIR/.git" ]]; then
+# ── Report workspace git drift since the most recent pre-update tag ─────────
+if [[ -n "$CLAWD_DIR" ]] && command -v git >/dev/null 2>&1 && [[ -d "$CLAWD_DIR/.git" ]]; then
   PRE_TAG=$(git -C "$CLAWD_DIR" tag -l 'openclaw-update-pre-*' --sort=-creatordate | head -1)
   if [[ -n "$PRE_TAG" ]]; then
     CHANGED=$(git -C "$CLAWD_DIR" diff --name-only "$PRE_TAG"...HEAD 2>/dev/null | wc -l | tr -d ' ')
     if [[ "$CHANGED" != "0" ]]; then
       echo ""
-      echo "  ~/clawd has $CHANGED file(s) changed since the pre-update tag '$PRE_TAG'."
+      echo "  $CLAWD_DIR has $CHANGED file(s) changed since the pre-update tag '$PRE_TAG'."
       echo "  Review:  git -C $CLAWD_DIR diff $PRE_TAG"
       echo "  Revert:  git -C $CLAWD_DIR reset --hard $PRE_TAG   ← destructive; review first"
       echo ""
@@ -181,20 +234,22 @@ fi
 
 # ── Restart the gateway ─────────────────────────────────────────────────────
 log "Starting gateway..."
-if ! launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/tmp/launchctl-rollback-bootstrap.err; then
-  log "  launchctl bootstrap failed: $(cat /tmp/launchctl-rollback-bootstrap.err)"
-  log "  Trying legacy launchctl load..."
-  if ! launchctl load "$PLIST" 2>/dev/null; then
-    echo ""
-    echo "═══════════════════════════════════════════════════════════"
-    echo "  CRITICAL: Rollback failed to start gateway."
-    echo "  Gateway is NOT running. Manual recovery:"
+if ! "$NODE" "$GW_CONTROL" start; then
+  echo ""
+  echo "═══════════════════════════════════════════════════════════"
+  echo "  CRITICAL: Rollback failed to start gateway."
+  echo "  Gateway is NOT running. Manual recovery:"
+  if [[ "$PLATFORM" == "Darwin" ]]; then
     echo "    launchctl bootout gui/\$(id -u)/$LAUNCHD_LABEL 2>/dev/null"
     echo "    sleep 5"
     echo "    launchctl bootstrap gui/\$(id -u) $PLIST"
-    echo "═══════════════════════════════════════════════════════════"
-    exit 2
+  else
+    LINUX_UNIT="${OPENCLAW_SYSTEMD_UNIT:-openclaw-gateway}"
+    echo "    systemctl --user stop ${LINUX_UNIT}.service"
+    echo "    systemctl --user start ${LINUX_UNIT}.service"
   fi
+  echo "═══════════════════════════════════════════════════════════"
+  exit 2
 fi
 
 # Wait for gateway to actually respond before declaring success.

@@ -3,6 +3,18 @@
   "version": "1.0.0",
   "type": "module",
   "description": "Safe openclaw update system — versioned installs, smoketest, rollback",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "tests",
+    "snapshot-whitelist.txt",
+    "state-repo.gitignore",
+    "install.sh",
+    "README.md"
+  ],
   "bin": {
     "openclaw-smoketest": "./bin/openclaw-smoketest",
     "openclaw-rollback": "./bin/openclaw-rollback",

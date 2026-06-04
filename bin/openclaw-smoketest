@@ -9,17 +9,15 @@
 //   openclaw-smoketest --skip 07,09           # skip specific test IDs
 //   openclaw-smoketest --target sandbox --port 18790 --install-dir ~/.openclaw/versions/X/lib/node_modules/openclaw
 
-import { resolve } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { resolve, dirname } from 'node:path';
 import { homedir } from 'node:os';
-import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { existsSync, lstatSync } from 'node:fs';
 import { runSmoketest, formatTextReport } from '../lib/smoketest.mjs';
 
 function defaultInstallDir() {
-  // Post-migration: use ~/.openclaw/current/lib/node_modules/openclaw or
-  // ~/.openclaw/current/node_modules/openclaw (npm-prefix layout).
-  // Pre-migration: fall back to the brew global path.
+  // Post-migration: use ~/.openclaw/current symlink (lib or npm-prefix layout).
   const currentLink = resolve(homedir(), '.openclaw/current');
   if (existsSync(currentLink) && lstatSync(currentLink).isSymbolicLink()) {
     const libLayout = resolve(currentLink, 'lib/node_modules/openclaw');
@@ -27,7 +25,28 @@ function defaultInstallDir() {
     const npmLayout = resolve(currentLink, 'node_modules/openclaw');
     if (existsSync(npmLayout)) return npmLayout;
   }
-  return '/opt/homebrew/lib/node_modules/openclaw';
+  // Env var override
+  if (process.env.OPENCLAW_INSTALL_DIR) return process.env.OPENCLAW_INSTALL_DIR;
+  // npm global install: detect via npm root -g
+  const node = process.env.OPENCLAW_NODE || process.execPath;
+  let npm;
+  if (process.env.OPENCLAW_NPM) {
+    npm = process.env.OPENCLAW_NPM;
+  } else {
+    const npmSibling = resolve(dirname(node), 'npm');
+    if (existsSync(npmSibling)) {
+      npm = npmSibling;
+    } else {
+      const r = spawnSync('which', ['npm'], { encoding: 'utf8', timeout: 5000 });
+      npm = r.status === 0 ? r.stdout.trim() : 'npm';
+    }
+  }
+  const r = spawnSync(npm, ['root', '-g'], { encoding: 'utf8', timeout: 15000 });
+  if (r.status === 0 && r.stdout.trim()) {
+    const candidate = resolve(r.stdout.trim(), 'openclaw');
+    if (existsSync(resolve(candidate, 'openclaw.mjs'))) return candidate;
+  }
+  return null;
 }
 
 const HERE = dirname(fileURLToPath(import.meta.url));

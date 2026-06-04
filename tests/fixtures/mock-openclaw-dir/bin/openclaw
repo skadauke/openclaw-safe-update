@@ -1,0 +1,3 @@
+#!/bin/sh
+# Managed openclaw wrapper stub — openclaw is managed by openclaw-update
+exec node "$(dirname "$0")/../../../openclaw.mjs" "$@"
