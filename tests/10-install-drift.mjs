@@ -2,7 +2,7 @@
 // the managed install. After migration: current symlink exists, brew binary is
 // our stub. Before migration: just verifies the expected homebrew path is in place.
 
-import { existsSync, readFileSync, lstatSync } from 'node:fs';
+import { existsSync, readFileSync, lstatSync, realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 
@@ -30,8 +30,8 @@ export default {
       notes.push('versioned install detected');
 
       // 1. current symlink must resolve to the same installDir passed by the orchestrator
-      const r = spawnSync('readlink', ['-f', CURRENT_SYMLINK], { encoding: 'utf8' });
-      const resolved = (r.stdout || '').trim();
+      let resolved = '';
+      try { resolved = realpathSync(CURRENT_SYMLINK); } catch { /* ignore */ }
       if (!resolved) {
         issues.push('~/.openclaw/current symlink does not resolve');
       } else {
