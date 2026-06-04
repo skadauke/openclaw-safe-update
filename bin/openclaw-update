@@ -39,8 +39,9 @@ Commands:
   sandbox-test <version|latest> [--config-source <path>]
                                  Boot staged version on an alternate port/config and smoketest it.
                                  --config-source <path>: dry-run a proposed openclaw.json edit before applying to live.
-  smoketest [--quick] [--json] [--with-models] [--no-telegram]
+  smoketest [--quick] [--json] [--with-models] [--no-telegram] [--alert-on-fail]
                                  Run live smoketest against current gateway
+                                 --alert-on-fail: post to alert-bus DM if any tests fail
   promote <version> --yes [--skip <ids>]
                                  Swap ~/.openclaw/current to a staged version, restart, smoketest; auto-rollback on failure.
                                  --skip 04,11 to skip specific test ids during the post-promote smoketest.
@@ -64,7 +65,7 @@ Environment overrides:
 }
 
 function parse(argv) {
-  const args = { _: [], json: false, yes: false, dryRun: false, quick: false, keep: 3, telegram: true, withModels: false, interpret: false, port: 18790, bonjourWatchSec: 120, verbose: false, skip: [], configSource: null, includeBroken: false, removeVersions: false };
+  const args = { _: [], json: false, yes: false, dryRun: false, quick: false, keep: 3, telegram: true, withModels: false, interpret: false, port: 18790, bonjourWatchSec: 120, verbose: false, skip: [], configSource: null, alertOnFail: false, includeBroken: false, removeVersions: false };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--json') args.json = true;
@@ -80,6 +81,7 @@ function parse(argv) {
     else if (a === '--skip') args.skip = argv[++i].split(',').map(s => s.trim()).filter(Boolean);
     else if (a === '--verbose') args.verbose = true;
     else if (a === '--interpret') args.interpret = true;
+    else if (a === '--alert-on-fail') args.alertOnFail = true;
     else if (a === '--keep') args.keep = Number(argv[++i]);
     else if (a === '--include-broken') args.includeBroken = true;
     else if (a === '--remove-versions') args.removeVersions = true;
@@ -466,6 +468,12 @@ async function cmdSmoketest(args) {
   });
   if (args.json) console.log(JSON.stringify(report, null, 2));
   else console.log(formatTextReport(report));
+  if (args.alertOnFail && report.failed > 0) {
+    const failedTests = report.results.filter(r => !r.ok);
+    const details = failedTests.map(r => `${r.id}-${r.name}${r.detail ? `: ${r.detail}` : ''}`).join('; ');
+    const message = `Smoketest failed: ${report.failed}/${report.passed + report.failed} tests failed. ${details}`;
+    await announceToDM(JSON.stringify({ source: 'openclaw-update', kind: 'smoketest-failure', urgency: 'now', message }));
+  }
   process.exit(report.failed ? 1 : 0);
 }
 
