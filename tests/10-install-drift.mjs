@@ -55,7 +55,7 @@ export default {
       if (!existsSync(managedWrapper)) {
         issues.push(`managed wrapper missing: ${managedWrapper}`);
       } else {
-        const whichR = spawnSync('/bin/zsh', ['-ic', 'which openclaw'], { encoding: 'utf8', env: process.env });
+        const whichR = spawnSync('/bin/zsh', ['-ic', 'which openclaw'], { encoding: 'utf8', env: process.env, timeout: 3000 });
         const which = (whichR.stdout || '').trim();
         if (which && which !== managedWrapper) {
           issues.push(`interactive zsh resolves openclaw = ${which}, expected ${managedWrapper} — ~/.zshrc/.zprofile may be wrong`);

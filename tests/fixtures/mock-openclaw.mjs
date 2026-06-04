@@ -8,7 +8,10 @@
 //   fatal-log → /healthz returns HTTP 500, writes fatal lines to stderr
 
 import { createServer } from 'node:http';
+import { resolve, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
+const HERE = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
 
 if (args[0] === '--version') {
@@ -57,10 +60,11 @@ if (args[0] === '--version') {
   process.on('SIGINT', () => { server.close(); process.exit(0); });
   // Keep process alive — HTTP server holds the event loop open.
 } else if (args[0] === 'mcp' && args[1] === 'list') {
+  // mock-tools is listed first so tryStdioMcp uses it before trying slow npx downloads.
   const servers = [
+    { name: 'mock-tools', transport: 'stdio', command: 'node', args: [resolve(HERE, 'mock-mcp-server.mjs')] },
     { name: 'filesystem', transport: 'stdio', command: 'npx', args: ['-y', '@modelcontextprotocol/server-filesystem'] },
     { name: 'memory', transport: 'stdio', command: 'npx', args: ['-y', '@modelcontextprotocol/server-memory'] },
-    { name: 'mock-tools', transport: 'stdio', command: 'node', args: ['mock-mcp-server.mjs'] },
   ];
   process.stdout.write(JSON.stringify(servers, null, 2) + '\n');
   process.exit(0);
