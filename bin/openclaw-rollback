@@ -125,8 +125,31 @@ fi
 # Package diff: npm changes between versions (max 5000 chars)
 NPM=/opt/homebrew/bin/npm
 if [[ -x "$NPM" ]]; then
-  "$NPM" diff --diff="openclaw@${PREV_VER}" --diff="openclaw@${CURRENT_VER}" 2>&1 \
-    | head -c 5000 > "$FD/diff-pkg.txt" || true
+  if command -v gtimeout >/dev/null 2>&1; then
+    gtimeout 10s "$NPM" diff --diff="openclaw@${PREV_VER}" --diff="openclaw@${CURRENT_VER}" 2>&1 \
+      | head -c 5000 > "$FD/diff-pkg.txt" || true
+  elif command -v timeout >/dev/null 2>&1; then
+    timeout 10s "$NPM" diff --diff="openclaw@${PREV_VER}" --diff="openclaw@${CURRENT_VER}" 2>&1 \
+      | head -c 5000 > "$FD/diff-pkg.txt" || true
+  else
+    set -m
+    (
+      "$NPM" diff --diff="openclaw@${PREV_VER}" --diff="openclaw@${CURRENT_VER}" 2>&1 \
+        | head -c 5000 > "$FD/diff-pkg.txt"
+    ) &
+    npm_diff_pid=$!
+    set +m
+    (
+      sleep 10
+      # Kill the whole process group and clear partial output so fallback runs.
+      kill -- -"$npm_diff_pid" 2>/dev/null || true
+      : > "$FD/diff-pkg.txt" 2>/dev/null || true
+    ) &
+    npm_diff_watchdog_pid=$!
+    wait "$npm_diff_pid" 2>/dev/null || true
+    kill "$npm_diff_watchdog_pid" 2>/dev/null || true
+    wait "$npm_diff_watchdog_pid" 2>/dev/null || true
+  fi
 fi
 if [[ ! -s "$FD/diff-pkg.txt" ]]; then
   {
