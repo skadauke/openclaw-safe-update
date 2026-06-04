@@ -1,13 +1,10 @@
 // Test #09 — Post one real Telegram message to DM via direct Bot API.
 // Confirms: Bot token is valid, Bot API reachable.
 // On by default; pass --no-telegram to skip (e.g., for CI or sandbox runs).
-// Uses the alert-bus telegram-post.mjs directly — no gateway needed.
-
-import { resolve } from 'node:path';
-import { homedir } from 'node:os';
-
-const ALERT_BUS = resolve(homedir(), 'clawd/moby-os/intelligence/alert-bus');
-const DM_CHAT_ID = 8290418965;
+//
+// Requires env vars:
+//   OPENCLAW_TELEGRAM_BOT_TOKEN — Telegram Bot API token
+//   OPENCLAW_TELEGRAM_CHAT_ID   — numeric chat ID to send test message to
 
 export default {
   id: '09',
@@ -18,15 +15,24 @@ export default {
   requiresTelegram: true,
   timeout_ms: 15000,
   async run(ctx) {
-    let sendMessage;
-    try {
-      ({ sendMessage } = await import(resolve(ALERT_BUS, 'lib/telegram-post.mjs')));
-    } catch (err) {
-      return { ok: false, detail: `could not load telegram-post: ${err.message}` };
+    const token = process.env.OPENCLAW_TELEGRAM_BOT_TOKEN;
+    const chatId = process.env.OPENCLAW_TELEGRAM_CHAT_ID;
+    if (!token || !chatId) {
+      return { ok: false, detail: 'OPENCLAW_TELEGRAM_BOT_TOKEN and OPENCLAW_TELEGRAM_CHAT_ID env vars must be set' };
     }
     const text = `[openclaw smoketest] gateway=${ctx.port} ${new Date().toISOString()}`;
-    const r = await sendMessage({ chat_id: DM_CHAT_ID, thread_id: null, text });
-    if (!r.ok) return { ok: false, detail: `send failed: ${r.reason} (${JSON.stringify(r.raw ?? '').slice(0, 100)})` };
-    return { ok: true, detail: `message_id=${r.message_id}` };
+    try {
+      const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: Number(chatId), text }),
+        signal: AbortSignal.timeout(10000),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!json.ok) return { ok: false, detail: `send failed: ${json.description ?? JSON.stringify(json).slice(0, 100)}` };
+      return { ok: true, detail: `message_id=${json.result?.message_id}` };
+    } catch (err) {
+      return { ok: false, detail: `fetch error: ${err.message}` };
+    }
   },
 };
