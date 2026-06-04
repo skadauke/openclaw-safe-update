@@ -4,10 +4,8 @@
 
 import { existsSync, readFileSync, lstatSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { homedir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 
-const CURRENT_SYMLINK = resolve(homedir(), '.openclaw/current');
 const BREW_BINARY = '/opt/homebrew/bin/openclaw';
 const STUB_FINGERPRINT = 'openclaw is managed by openclaw-update';
 
@@ -17,6 +15,10 @@ export default {
   modes: ['current', 'quick'],
   timeout_ms: 5000,
   run(ctx) {
+    // Use ctx.configDir so this test works against both the live install and
+    // the hermetic mock fixture (where HOME/.openclaw may not exist).
+    const CURRENT_SYMLINK = resolve(ctx.configDir, 'current');
+
     const issues = [];
     const notes = [];
 
@@ -49,7 +51,7 @@ export default {
       // 3. The managed wrapper must exist and interactive zsh should resolve it.
       // Non-interactive launchd/agent PATHs may not source ~/.zshrc; don't fail the
       // safety check just because this process inherited a minimal PATH.
-      const managedWrapper = resolve(homedir(), '.openclaw/bin/openclaw');
+      const managedWrapper = resolve(ctx.configDir, 'bin/openclaw');
       if (!existsSync(managedWrapper)) {
         issues.push(`managed wrapper missing: ${managedWrapper}`);
       } else {

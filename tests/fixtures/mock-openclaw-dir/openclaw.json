@@ -1,0 +1,18 @@
+{
+  "version": "2026.1.1",
+  "discovery": {
+    "mdns": { "mode": "off" }
+  },
+  "plugins": {
+    "entries": {
+      "mock-plugin": { "enabled": true }
+    }
+  },
+  "models": [
+    {
+      "id": "mock-model-primary",
+      "provider": "mock",
+      "role": "primary"
+    }
+  ]
+}
