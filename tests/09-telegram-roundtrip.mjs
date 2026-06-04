@@ -2,8 +2,8 @@
 // Confirms: Bot token is valid, Bot API reachable.
 // On by default; pass --no-telegram to skip (e.g., for CI or sandbox runs).
 //
-// Requires env vars:
-//   OPENCLAW_TELEGRAM_BOT_TOKEN — Telegram Bot API token
+// Credentials resolve from env vars, repo .env, and openclaw.json:
+//   OPENCLAW_TELEGRAM_BOT_TOKEN — Telegram Bot API token (or openclaw.json)
 //   OPENCLAW_TELEGRAM_CHAT_ID   — numeric chat ID to send test message to
 
 export default {
@@ -15,8 +15,8 @@ export default {
   requiresTelegram: true,
   timeout_ms: 15000,
   async run(ctx) {
-    const token = process.env.OPENCLAW_TELEGRAM_BOT_TOKEN;
-    const chatId = process.env.OPENCLAW_TELEGRAM_CHAT_ID;
+    const token = ctx.telegramToken || process.env.OPENCLAW_TELEGRAM_BOT_TOKEN;
+    const chatId = ctx.telegramChatId || process.env.OPENCLAW_TELEGRAM_CHAT_ID;
     if (!token || !chatId) {
       return { ok: false, detail: 'OPENCLAW_TELEGRAM_BOT_TOKEN and OPENCLAW_TELEGRAM_CHAT_ID env vars must be set' };
     }

@@ -29,6 +29,8 @@ bin/openclaw-update sandbox-test latest --bonjour-watch-sec 30
 bin/openclaw-update sandbox-test current --config-source /path/to/proposed-openclaw.json
 ```
 
+To enable the live Telegram roundtrip test (#09), copy `.env.example` to `.env` and set `OPENCLAW_TELEGRAM_CHAT_ID`. The bot token is read automatically from `~/.openclaw/openclaw.json` unless you override it in the environment or `.env`.
+
 One-time switchover, only on hosts that have not migrated yet:
 
 ```bash
