@@ -57,14 +57,9 @@ if grep -q "OPENCLAW_DISABLE_BONJOUR" "$PLIST" && grep -A1 "OPENCLAW_DISABLE_BON
   ENV_GUARD=1
 fi
 if [[ -f "$OPENCLAW_DIR/openclaw.json" ]]; then
-  CFG_GUARD=$(python3 -c "
-import json, sys
-try:
-  c = json.load(open('$OPENCLAW_DIR/openclaw.json'))
-  print(1 if c.get('discovery',{}).get('mdns',{}).get('mode') == 'off' else 0)
-except Exception:
-  print(0)
-")
+  if node -e "const c=JSON.parse(require('fs').readFileSync('$OPENCLAW_DIR/openclaw.json','utf8'));process.exit(c?.discovery?.mdns?.mode==='off'?0:1)" 2>/dev/null; then
+    CFG_GUARD=1
+  fi
 fi
 if [[ "$ENV_GUARD" != "1" && "$CFG_GUARD" != "1" ]]; then
   die "Bonjour is NOT disabled. Set either OPENCLAW_DISABLE_BONJOUR=1 in $PLIST or discovery.mdns.mode=off in $OPENCLAW_DIR/openclaw.json before migrating."
@@ -141,14 +136,14 @@ log "Step B — Creating symlinks..."
 
 if [[ ! -L "$OPENCLAW_DIR/current" ]]; then
   ln -sfn "versions/$CURRENT_VER" "$OPENCLAW_DIR/current"
-  ok "~/.openclaw/current → versions/$CURRENT_VER"
+  ok "$HOME/.openclaw/current → versions/$CURRENT_VER"
 else
   skip "current symlink already exists: $(readlink "$OPENCLAW_DIR/current")"
 fi
 
 if [[ ! -L "$OPENCLAW_DIR/previous" ]]; then
   ln -sfn "versions/$CURRENT_VER" "$OPENCLAW_DIR/previous"
-  ok "~/.openclaw/previous → versions/$CURRENT_VER (same as current initially)"
+  ok "$HOME/.openclaw/previous → versions/$CURRENT_VER (same as current initially)"
 else
   skip "previous symlink already exists: $(readlink "$OPENCLAW_DIR/previous")"
 fi
@@ -167,7 +162,7 @@ else
 exec /opt/homebrew/bin/node "$HOME/.openclaw/current/lib/node_modules/openclaw/openclaw.mjs" "$@"
 WRAPPER_EOF
   chmod +x "$WRAPPER"
-  ok "~/.openclaw/bin/openclaw created."
+  ok "$HOME/.openclaw/bin/openclaw created."
 fi
 
 # ── Step D — Update launchd plist ───────────────────────────────────────────
@@ -184,30 +179,19 @@ else
 
   # Build the new plist by replacing the hard-coded brew paths with the symlinked path.
   NEW_ENTRY="$HOME/.openclaw/current/lib/node_modules/openclaw/dist/index.js"
-  sed -i '' \
-    "s|/opt/homebrew/lib/node_modules/openclaw/dist/index.js|$NEW_ENTRY|g" \
+  perl -i -pe \
+    "s|/opt/homebrew/lib/node_modules/openclaw/dist/index.js|${NEW_ENTRY}|g" \
     "$PLIST"
 
   # Drop the hard-coded version env var — it would lie after version changes.
-  python3 - "$PLIST" <<'PYEOF'
-import sys, re
-p = sys.argv[1]
-txt = open(p).read()
-# Remove the OPENCLAW_SERVICE_VERSION key-value pair block
-txt = re.sub(
-  r'<key>OPENCLAW_SERVICE_VERSION</key>\s*<string>[^<]*</string>\s*',
-  '',
-  txt
-)
-open(p, 'w').write(txt)
-PYEOF
+  perl -i -0pe 's|<key>OPENCLAW_SERVICE_VERSION</key>\s*<string>[^<]*</string>\s*||g' "$PLIST"
 
   ok "Plist updated to use ~/.openclaw/current/..."
   log "Restarting gateway..."
   launchctl bootout "gui/$(id -u)/$LAUNCHD_LABEL" 2>/dev/null || launchctl unload "$PLIST" 2>/dev/null || true
   # Wait for the previous process to actually release port 18789 before bootstrapping.
   for _ in 1 2 3 4 5 6 7 8 9 10; do
-    if ! lsof -nP -iTCP:18789 -sTCP:LISTEN >/dev/null 2>&1; then break; fi
+    if ! node -e "const net=require('net'),s=net.createConnection({port:18789,host:'127.0.0.1'},()=>{s.destroy();process.exit(0)});s.on('error',()=>process.exit(1))" 2>/dev/null; then break; fi
     sleep 1
   done
   if ! launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/tmp/launchctl-bootstrap.err; then
@@ -242,7 +226,7 @@ restore_plist_and_die() {
   launchctl bootout "gui/$(id -u)/$LAUNCHD_LABEL" 2>/dev/null || true
   # Wait for port release before re-bootstrapping the original
   for _ in 1 2 3 4 5 6 7 8 9 10; do
-    if ! lsof -nP -iTCP:18789 -sTCP:LISTEN >/dev/null 2>&1; then break; fi
+    if ! node -e "const net=require('net'),s=net.createConnection({port:18789,host:'127.0.0.1'},()=>{s.destroy();process.exit(0)});s.on('error',()=>process.exit(1))" 2>/dev/null; then break; fi
     sleep 1
   done
   cp "$PLIST_BACKUP" "$PLIST"

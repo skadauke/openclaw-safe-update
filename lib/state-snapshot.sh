@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Shared snapshot/restore helpers for openclaw-update.
 # Source this file from bash scripts:
 #   source "$SCRIPT_DIR/../lib/state-snapshot.sh"
@@ -10,11 +11,10 @@
 OPENCLAW_DIR_DEFAULT="$HOME/.openclaw"
 RESILIENCE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WHITELIST_FILE="$RESILIENCE_ROOT/snapshot-whitelist.txt"
-
 if command -v sha256sum >/dev/null 2>&1; then
-  SHA256=(sha256sum)
+  SHA256CMD=(sha256sum)
 else
-  SHA256=(shasum -a 256)
+  SHA256CMD=(shasum -a 256)
 fi
 
 # Print whitelist entries (skipping comments and blank lines)
@@ -34,10 +34,12 @@ snapshot_state() {
 
   local manifest_tmp
   manifest_tmp=$(mktemp)
-  echo "{" > "$manifest_tmp"
-  echo "  \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"," >> "$manifest_tmp"
-  echo "  \"openclaw_dir\": \"$openclaw_dir\"," >> "$manifest_tmp"
-  echo "  \"files\": {" >> "$manifest_tmp"
+  {
+    echo "{"
+    echo "  \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\","
+    echo "  \"openclaw_dir\": \"$openclaw_dir\","
+    echo "  \"files\": {"
+  } > "$manifest_tmp"
 
   local first=1
   local entry src dest sha
@@ -48,16 +50,18 @@ snapshot_state() {
     if [[ -f "$src" ]]; then
       mkdir -p "$(dirname "$dest")"
       cp -p "$src" "$dest"
-      sha=$("${SHA256[@]}" "$src" | awk '{print $1}')
+      sha=$("${SHA256CMD[@]}" "$src" | awk '{print $1}')
       [[ $first -eq 1 ]] || echo "," >> "$manifest_tmp"
       printf '    "%s": "%s"' "$entry" "$sha" >> "$manifest_tmp"
       first=0
     fi
   done < <(_whitelist_entries)
 
-  echo "" >> "$manifest_tmp"
-  echo "  }" >> "$manifest_tmp"
-  echo "}" >> "$manifest_tmp"
+  {
+    echo ""
+    echo "  }"
+    echo "}"
+  } >> "$manifest_tmp"
   mv "$manifest_tmp" "$snap_dir/snapshot.json"
   echo "snapshotted state → $snap_dir"
 }
@@ -117,8 +121,8 @@ diff_state() {
     [[ -z "$entry" ]] && continue
     [[ -f "$openclaw_dir/$entry" ]] || { echo "  - missing (live): $entry"; continue; }
     [[ -f "$snap_dir/$entry" ]] || { echo "  - missing (snap): $entry"; continue; }
-    live_sha=$("${SHA256[@]}" "$openclaw_dir/$entry" | awk '{print $1}')
-    snap_sha=$("${SHA256[@]}" "$snap_dir/$entry" | awk '{print $1}')
+    live_sha=$("${SHA256CMD[@]}" "$openclaw_dir/$entry" | awk '{print $1}')
+    snap_sha=$("${SHA256CMD[@]}" "$snap_dir/$entry" | awk '{print $1}')
     if [[ "$live_sha" != "$snap_sha" ]]; then
       echo "  ≠ drift: $entry  (live=$live_sha snap=$snap_sha)"
     fi

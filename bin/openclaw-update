@@ -28,6 +28,7 @@ const MANIFEST = resolve(OPENCLAW_DIR, 'versions-manifest.json');
 const GATEWAY_LABEL = 'ai.openclaw.gateway';
 const GATEWAY_PLIST = getPlistPath(GATEWAY_LABEL);
 const WORKSPACE_GIT = process.env.OPENCLAW_UPDATE_WORKSPACE_GIT ?? null;
+const CLAWD_DIR = resolve(homedir(), 'clawd');
 const SNAPSHOT_HELPER = resolve(ROOT, 'lib/state-snapshot.sh');
 
 function usage() {

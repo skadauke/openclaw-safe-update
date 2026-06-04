@@ -25,7 +25,7 @@ LAUNCHD_LABEL="${OPENCLAW_LAUNCHD_LABEL:-ai.openclaw.gateway}"
 PLIST="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
 GW_CONTROL="$SCRIPT_DIR/../lib/gateway-control.mjs"
 
-# shellcheck source=../lib/state-snapshot.sh
+# shellcheck source=lib/state-snapshot.sh
 source "$SCRIPT_DIR/../lib/state-snapshot.sh"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -56,14 +56,9 @@ if [[ -f "$PLIST" ]] && grep -q "OPENCLAW_DISABLE_BONJOUR" "$PLIST" && \
   ENV_GUARD=1
 fi
 if [[ -f "$OPENCLAW_DIR/openclaw.json" ]]; then
-  CFG_GUARD=$(python3 -c "
-import json
-try:
-  c = json.load(open('$OPENCLAW_DIR/openclaw.json'))
-  print(1 if c.get('discovery',{}).get('mdns',{}).get('mode') == 'off' else 0)
-except Exception:
-  print(0)
-" 2>/dev/null || echo 0)
+  if node -e "const c=JSON.parse(require('fs').readFileSync('$OPENCLAW_DIR/openclaw.json','utf8'));process.exit(c?.discovery?.mdns?.mode==='off'?0:1)" 2>/dev/null; then
+    CFG_GUARD=1
+  fi
 fi
 if [[ "$ENV_GUARD" != "1" && "$CFG_GUARD" != "1" ]]; then
   echo ""
@@ -77,8 +72,8 @@ fi
 log "Bonjour guard: env=$ENV_GUARD config=$CFG_GUARD"
 
 # ── Verify versioned install is set up ─────────────────────────────────────
-[[ -L "$OPENCLAW_DIR/current" ]] || die "~/.openclaw/current is not a symlink. Has migrate-to-versioned.sh been run?"
-[[ -L "$OPENCLAW_DIR/previous" ]] || die "~/.openclaw/previous symlink missing — nothing to roll back to."
+[[ -L "$OPENCLAW_DIR/current" ]] || die "$HOME/.openclaw/current is not a symlink. Has migrate-to-versioned.sh been run?"
+[[ -L "$OPENCLAW_DIR/previous" ]] || die "$HOME/.openclaw/previous symlink missing — nothing to roll back to."
 
 CURRENT_TARGET=$(readlink -f "$OPENCLAW_DIR/current")
 PREVIOUS_TARGET=$(readlink -f "$OPENCLAW_DIR/previous")
@@ -103,7 +98,9 @@ tail -500 "$OPENCLAW_DIR/logs/gateway.err.log" 2>/dev/null > "$FD/gateway.err.lo
 cp "$OPENCLAW_DIR/openclaw.json" "$FD/openclaw.json.at-rollback" 2>/dev/null || true
 
 # Plist snapshot (macOS only)
-[[ "$PLATFORM" == "Darwin" ]] && cp "$PLIST" "$FD/gateway.plist.at-rollback" 2>/dev/null || true
+if [[ "$PLATFORM" == "Darwin" ]]; then
+  cp "$PLIST" "$FD/gateway.plist.at-rollback" 2>/dev/null || true
+fi
 
 # Manifest entry
 cat > "$FD/manifest.json" <<EOF
