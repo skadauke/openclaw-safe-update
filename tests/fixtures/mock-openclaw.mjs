@@ -61,8 +61,12 @@ if (args[0] === '--version') {
   // Keep process alive — HTTP server holds the event loop open.
 } else if (args[0] === 'mcp' && args[1] === 'list') {
   // mock-tools is listed first so tryStdioMcp uses it before trying slow npx downloads.
+  // Use the exact node binary via OPENCLAW_NODE_BIN (set by run-with-mock.mjs to
+  // process.execPath) rather than just 'node', which may not resolve via PATH on
+  // macOS CI runners where the toolcache node isn't added to every child process's PATH.
+  const nodeBin = process.env.OPENCLAW_NODE_BIN || process.execPath;
   const servers = [
-    { name: 'mock-tools', transport: 'stdio', command: 'node', args: [resolve(HERE, 'mock-mcp-server.mjs')] },
+    { name: 'mock-tools', transport: 'stdio', command: nodeBin, args: [resolve(HERE, 'mock-mcp-server.mjs')] },
     { name: 'filesystem', transport: 'stdio', command: 'npx', args: ['-y', '@modelcontextprotocol/server-filesystem'] },
     { name: 'memory', transport: 'stdio', command: 'npx', args: ['-y', '@modelcontextprotocol/server-memory'] },
   ];
