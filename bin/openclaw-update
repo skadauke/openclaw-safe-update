@@ -15,6 +15,7 @@ import { resolve, dirname, basename } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { runSmoketest, formatTextReport } from '../lib/smoketest.mjs';
+import { detectPlatform, getPlistPath, restartGateway as platformRestartGateway } from '../lib/gateway-control.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '..');
@@ -24,7 +25,7 @@ const CURRENT_LINK = resolve(OPENCLAW_DIR, 'current');
 const PREVIOUS_LINK = resolve(OPENCLAW_DIR, 'previous');
 const MANIFEST = resolve(OPENCLAW_DIR, 'versions-manifest.json');
 const GATEWAY_LABEL = 'ai.openclaw.gateway';
-const GATEWAY_PLIST = resolve(homedir(), `Library/LaunchAgents/${GATEWAY_LABEL}.plist`);
+const GATEWAY_PLIST = getPlistPath(GATEWAY_LABEL);
 const WORKSPACE_GIT = process.env.OPENCLAW_UPDATE_WORKSPACE_GIT ?? null;
 const SNAPSHOT_HELPER = resolve(ROOT, 'lib/state-snapshot.sh');
 
@@ -459,33 +460,6 @@ async function cmdSmoketest(args) {
   process.exit(report.failed ? 1 : 0);
 }
 
-function waitServiceGone(label, maxMs = 30000) {
-  // launchctl bootout is async; the service can linger for several seconds.
-  // Issuing `bootstrap` while the old job is still tearing down throws
-  // "Bootstrap failed: 5: Input/output error". Poll launchctl print until the
-  // service is fully unloaded.
-  const target = `gui/${process.getuid()}/${label}`;
-  const deadline = Date.now() + maxMs;
-  while (Date.now() < deadline) {
-    const r = spawnSync('launchctl', ['print', target], { encoding: 'utf8', timeout: 5000 });
-    // exit 113 / "Could not find service" → fully unloaded
-    if (r.status !== 0 && /Could not find service/.test(r.stderr + r.stdout)) return true;
-    spawnSync('sleep', ['0.5']);
-  }
-  return false;
-}
-
-function restartGateway() {
-  console.log('  → launchctl bootout (waiting for service to unload)...');
-  // bootout may return non-zero if not loaded; ignore that case.
-  spawnSync('launchctl', ['bootout', `gui/${process.getuid()}/${GATEWAY_LABEL}`], { encoding: 'utf8', timeout: 15000 });
-  if (!waitServiceGone(GATEWAY_LABEL, 30000)) {
-    console.log('  ⚠ service still showing after 30s; proceeding anyway');
-  }
-  console.log('  → launchctl bootstrap...');
-  const r = run('launchctl', ['bootstrap', `gui/${process.getuid()}`, GATEWAY_PLIST], { timeout: 15000 });
-  if (r.status !== 0) throw new Error(`launchctl bootstrap failed: ${r.stderr || r.stdout}`);
-}
 
 function snapshotState(versionDirPath) {
   const r = spawnSync('bash', ['-c', `source "${SNAPSHOT_HELPER}" && snapshot_state "${versionDirPath}"`], { encoding: 'utf8', timeout: 30000 });
@@ -533,13 +507,11 @@ function tagClawdGit(oldVersion, newVersion) {
 }
 
 function assertBonjourDisabled() {
-  // Belt-and-suspenders pre-flight: refuse to promote unless at least one
-  // Bonjour kill-switch is active. Without this, the gateway can crash-loop
-  // on macOS during the post-promote restart and lock the user out.
-  const plistPath = resolve(process.env.HOME, 'Library/LaunchAgents/ai.openclaw.gateway.plist');
+  // Bonjour crash-loop is macOS-only; no guard needed on Linux.
+  if (detectPlatform() !== 'macos') return;
   let envGuard = false;
-  if (existsSync(plistPath)) {
-    const plist = readFileSync(plistPath, 'utf8');
+  if (existsSync(GATEWAY_PLIST)) {
+    const plist = readFileSync(GATEWAY_PLIST, 'utf8');
     const idx = plist.indexOf('OPENCLAW_DISABLE_BONJOUR');
     envGuard = idx !== -1 && /<string>1<\/string>/.test(plist.slice(idx));
   }
@@ -555,7 +527,7 @@ function assertBonjourDisabled() {
     throw new Error(
       'Bonjour is NOT disabled. Refusing to promote — gateway may crash-loop after restart.\n' +
       '  Fix: set discovery.mdns.mode = "off" in ~/.openclaw/openclaw.json,\n' +
-      '       OR add OPENCLAW_DISABLE_BONJOUR=1 to ~/Library/LaunchAgents/ai.openclaw.gateway.plist.'
+      `       OR add OPENCLAW_DISABLE_BONJOUR=1 to ${GATEWAY_PLIST}.`
     );
   }
   console.log(`Bonjour guard: env=${envGuard ? 'on' : 'off'} config=${configGuard ? 'on' : 'off'}`);
@@ -608,7 +580,7 @@ async function cmdPromote(args) {
   addEvent({ event: 'promote', current: version, previous: oldVersion, path: target, clawdTag });
 
   try {
-    restartGateway();
+    await platformRestartGateway(packageDir(version));
     const report = await runSmoketest({ target: 'current', mode: 'quick', installDir: packageDir(version), configDir: OPENCLAW_DIR, port: 18789, models: args.withModels });
     console.log(formatTextReport(report));
     if (report.failed) throw new Error('post-promote smoketest failed');
