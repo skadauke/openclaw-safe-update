@@ -234,6 +234,15 @@ export default {
     }
 
     if (tools === null) {
+      // With no configured servers the only candidate was the synthetic
+      // http://127.0.0.1:<port>/mcp fallback — and the gateway does not serve MCP
+      // there. That surface only exists under `openclaw mcp serve`; the port
+      // otherwise answers /mcp with the control-UI SPA catch-all. Failing here
+      // reported "MCP is broken" on every install that simply has no MCP servers
+      // configured, so phase 1 is the whole meaningful check in that case.
+      if (servers.length === 0) {
+        return { ok: true, detail: 'mcp config readable (0 configured servers; no MCP surface to hand-shake)' };
+      }
       return {
         ok: false,
         detail: `mcp list ok (${configCount} server${configCount === 1 ? '' : 's'}) but tools/list handshake failed on all candidates`,
