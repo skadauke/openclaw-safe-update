@@ -1,0 +1,246 @@
+#!/usr/bin/env node
+// safe-restart — verified OpenClaw gateway restart.
+//
+// Usage:
+//   safe-restart [--reason <label>] [--timeout <sec>] [--no-snapshot] [--dry-run]
+//
+// What it does:
+//   1. Snapshots current state via safe-state (skippable; non-fatal if it fails)
+//   2. Captures err-log baseline, then kickstarts the gateway
+//   3. Polls /healthz until healthy, fast-failing if the daemon crash-loops
+//   4. Notifies + exits non-zero if it never comes back
+//
+// There is nothing to roll back — a restart changes no config — so unlike
+// safe-config-edit this only reports. The snapshot exists so that if the
+// restart surfaces a pre-existing broken state, there's a restore point:
+//   safe-state restore <sha>
+//
+// NOTE: this drops Telegram + MCP for ~10s and kills the active agent session.
+// Run it from a terminal, not from an assistant tool call.
+
+import { spawnSync } from 'node:child_process';
+import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
+import { resolve, dirname } from 'node:path';
+import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const SAFE_STATE = resolve(HERE, 'safe-state');
+const OPENCLAW_DIR = resolve(homedir(), '.openclaw');
+// Bare `node` resolves against the caller's PATH, which may lead with an nvm
+// version too old for the gateway. Pin ours for this process and its children.
+const NODE = '/opt/homebrew/bin/node';
+process.env.PATH = `${dirname(NODE)}:${process.env.PATH ?? ''}`;
+// 5.28 split logs: plaintext gateway.err.log is mostly dead, real errors go to
+// gateway-structured.log (JSON). Scan both — regex still matches against raw
+// JSON because the message text is in the "message" field as a substring.
+const ERR_LOGS = [
+  resolve(OPENCLAW_DIR, 'logs/gateway-structured.log'),
+  resolve(OPENCLAW_DIR, 'logs/gateway.err.log'),
+];
+
+// Fatal patterns that mean the daemon will NOT recover by itself — don't wait
+// the full health window when we see these.
+const FATAL_PATTERNS = [
+  /Gateway failed to start/i,
+  /Invalid config/i,
+  /Cannot find module/i,
+  /EADDRINUSE/i,
+  /Uncaught (Exception|Error)/i,
+  /panic:/i,
+  /SyntaxError/i,
+];
+const FATAL_REPEAT_THRESHOLD = 2; // require >=2 distinct fatal lines (proves it's looping, not a stale tail)
+const GATEWAY_LABEL = 'ai.openclaw.gateway';
+const GATEWAY_PLIST = resolve(homedir(), `Library/LaunchAgents/${GATEWAY_LABEL}.plist`);
+const PORT = 18789;
+
+async function notify(text) {
+  const cmd = process.env.OPENCLAW_UPDATE_NOTIFY_CMD;
+  if (!cmd) {
+    process.stderr.write(`[safe-restart] ${text}\n`);
+    return;
+  }
+  try {
+    const payload = JSON.stringify({ source: 'safe-restart', message: text, timestamp: new Date().toISOString() });
+    const r = spawnSync('sh', ['-c', cmd], { input: payload, encoding: 'utf8', timeout: 10000 });
+    if (r.status !== 0) process.stderr.write(`[notify] command failed (non-fatal): ${(r.stderr || r.stdout || '').trim().slice(0, 200)}\n`);
+  } catch (err) {
+    process.stderr.write(`[notify] skipped (non-fatal): ${err.message}\n`);
+  }
+}
+
+// ─── safe-state delegation ─────────────────────────────────────────────────
+// Best-effort only. A restart makes no change, so a failed snapshot is a lost
+// convenience, not a lost safety net — warn and carry on.
+
+function snapshotState(reason) {
+  const gitDir = resolve(HERE, '..', 'state-repo.git');
+  if (!existsSync(gitDir)) {
+    console.log('  → safe-state not initialized; skipping snapshot');
+    return null;
+  }
+  const r = spawnSync(NODE, [SAFE_STATE, 'snapshot', `restart-${reason}`], {
+    encoding: 'utf8',
+    timeout: 60000,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  if (r.status !== 0) {
+    console.log(`  → snapshot failed (non-fatal): ${(r.stderr || r.stdout || '').trim().slice(0, 160)}`);
+    return null;
+  }
+  const m = r.stdout.match(/snapshot:\s+([0-9a-f]{7,40})/);
+  return m ? m[1] : null;
+}
+
+function parse(argv) {
+  const args = { reason: 'manual', timeout: 60, snapshot: true, dryRun: false };
+  for (let i = 2; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--reason') args.reason = argv[++i].replace(/[^a-zA-Z0-9_-]/g, '-');
+    else if (a === '--timeout') args.timeout = Number(argv[++i]);
+    else if (a === '--no-snapshot') args.snapshot = false;
+    else if (a === '--dry-run') args.dryRun = true;
+    else if (a === '-h' || a === '--help') {
+      console.log(`Usage:
+  safe-restart [--reason <label>] [--timeout <sec>] [--no-snapshot] [--dry-run]
+
+Restarts the OpenClaw gateway via launchctl kickstart and verifies /healthz.
+Drops Telegram + MCP for ~10s and kills the active agent session.`);
+      process.exit(0);
+    }
+    else throw new Error(`unknown arg: ${a}`);
+  }
+  if (!Number.isFinite(args.timeout) || args.timeout <= 0) throw new Error('--timeout must be a positive number of seconds');
+  return args;
+}
+
+function kickstart() {
+  const uid = process.getuid();
+  spawnSync('launchctl', ['kickstart', '-k', `gui/${uid}/${GATEWAY_LABEL}`], { encoding: 'utf8', timeout: 15000 });
+}
+
+// Snapshot err-log sizes so we only inspect bytes written AFTER the kickstart.
+function errLogBaseline() {
+  const sizes = {};
+  for (const path of ERR_LOGS) {
+    try { sizes[path] = statSync(path).size; } catch { sizes[path] = 0; }
+  }
+  return sizes;
+}
+
+// Read bytes added since baseline across all watched logs, concatenated.
+// Returns '' on any error so we degrade to the slow health-check path.
+function readErrLogSince(baseline) {
+  let out = '';
+  for (const path of ERR_LOGS) {
+    try {
+      const sz = statSync(path).size;
+      const start = baseline[path] ?? 0;
+      if (sz <= start) continue;
+      const len = sz - start;
+      const fd = openSync(path, 'r');
+      try {
+        const buf = Buffer.alloc(len);
+        readSync(fd, buf, 0, len, start);
+        out += buf.toString('utf8');
+      } finally { closeSync(fd); }
+    } catch { /* skip this log on error */ }
+  }
+  return out;
+}
+
+function detectFatal(newText) {
+  if (!newText) return null;
+  const lines = newText.split('\n').filter(Boolean);
+  const fatal = [];
+  for (const line of lines) {
+    for (const pat of FATAL_PATTERNS) {
+      if (pat.test(line)) { fatal.push(line.slice(0, 240)); break; }
+    }
+  }
+  if (fatal.length < FATAL_REPEAT_THRESHOLD) return null;
+  const uniq = [...new Set(fatal)];
+  return { count: fatal.length, sample: uniq[uniq.length - 1] };
+}
+
+async function waitHealthy(maxSec, errBaseline) {
+  // errBaseline MUST be captured BEFORE kickstart by the caller. 5.28's
+  // launchd retries are throttled — if the new process writes fatal lines
+  // immediately and then launchd backs off, capturing baseline after
+  // kickstart would miss those lines (they'd be considered "old").
+  const url = `http://127.0.0.1:${PORT}/healthz`;
+  const start = Date.now();
+  const deadline = start + maxSec * 1000;
+  let lastErr = '';
+  while (Date.now() < deadline) {
+    // Fast-fail: if gateway is logging fatal errors on each LaunchAgent retry,
+    // no amount of waiting will help.
+    const fatal = detectFatal(readErrLogSince(errBaseline));
+    if (fatal) {
+      const elapsed = Math.round((Date.now() - start) / 1000);
+      return { ok: false, lastErr: fatal.sample, fastFail: true, fatalCount: fatal.count, elapsed };
+    }
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(2000) });
+      if (r.ok) {
+        const body = await r.json().catch(() => ({}));
+        if (body.ok) return { ok: true, elapsed: Math.round((Date.now() - start) / 1000) };
+      }
+      lastErr = `HTTP ${r.status}`;
+    } catch (err) {
+      lastErr = err.message;
+    }
+    await new Promise(r => setTimeout(r, 1500));
+  }
+  return { ok: false, lastErr };
+}
+
+async function main() {
+  const args = parse(process.argv);
+
+  if (args.dryRun) {
+    console.log('--dry-run: would do the following, and nothing else:');
+    if (args.snapshot) console.log(`  1. safe-state snapshot restart-${args.reason}`);
+    console.log(`  ${args.snapshot ? 2 : 1}. launchctl kickstart -k gui/${process.getuid()}/${GATEWAY_LABEL}`);
+    console.log(`  ${args.snapshot ? 3 : 2}. poll http://127.0.0.1:${PORT}/healthz for up to ${args.timeout}s`);
+    return;
+  }
+
+  if (args.snapshot) {
+    const sha = snapshotState(args.reason);
+    if (sha) console.log(`✓ state snapshot: ${sha.slice(0, 12)}  (restore: safe-state restore ${sha.slice(0, 12)})`);
+  }
+
+  console.log('→ kickstart gateway…  (Telegram + MCP drop for ~10s)');
+  const errBaseline = errLogBaseline();
+  kickstart();
+
+  console.log('→ waiting for /healthz…');
+  const h = await waitHealthy(args.timeout, errBaseline);
+  if (h.ok) {
+    console.log(`✓ gateway healthy in ${h.elapsed}s`);
+    await notify(`✅ OpenClaw gateway restarted ("${args.reason}"); healthy in ${h.elapsed}s`);
+    return;
+  }
+
+  if (h.fastFail) {
+    console.error(`✗ fast-fail: gateway crash-looping after ${h.elapsed}s (×${h.fatalCount} fatal log lines)`);
+    console.error(`  ${h.lastErr}`);
+    await notify(`🚨 OpenClaw gateway restart ("${args.reason}") CRASH-LOOPING after ${h.elapsed}s: ${h.lastErr}`);
+  } else {
+    console.error(`✗ gateway unhealthy after ${args.timeout}s (${h.lastErr})`);
+    await notify(`⚠️ OpenClaw gateway restart ("${args.reason}") unhealthy after ${args.timeout}s: ${h.lastErr}`);
+  }
+  console.error(`Recent state snapshots: safe-state log -n 5`);
+  console.error(`Last resort: launchctl bootout gui/$(id -u)/${GATEWAY_LABEL} && launchctl bootstrap gui/$(id -u) ${GATEWAY_PLIST}`);
+  process.exit(h.fastFail ? 2 : 1);
+}
+
+try {
+  await main();
+} catch (err) {
+  console.error(`safe-restart: ${err.message}`);
+  console.error('Try: safe-restart --help');
+  process.exit(1);
+}
