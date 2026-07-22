@@ -90,9 +90,21 @@ log "Forensics will be saved to: $FORENSICS_DIR/$TS-$CURRENT_VER/"
 mkdir -p "$FORENSICS_DIR/$TS-$CURRENT_VER"
 FD="$FORENSICS_DIR/$TS-$CURRENT_VER"
 
-# Gateway logs (last 500 lines each)
+# Gateway logs (last 500 lines each).
+# $OPENCLAW_DIR/logs/gateway.log is near-empty on a launchd install — the plist
+# writes the real console log to ~/Library/Logs/openclaw/, and startup failures
+# (migration guards, config errors) only ever land in gateway-structured.log.
+# Capturing just the ~/.openclaw copy is why the 2026.7.1-2 forensics dir
+# explained nothing.
 tail -500 "$OPENCLAW_DIR/logs/gateway.log" 2>/dev/null > "$FD/gateway.log.tail" || true
 tail -500 "$OPENCLAW_DIR/logs/gateway.err.log" 2>/dev/null > "$FD/gateway.err.log.tail" || true
+tail -2000 "$HOME/Library/Logs/openclaw/gateway.log" 2>/dev/null > "$FD/Library-gateway.log.tail" || true
+tail -2000 "$OPENCLAW_DIR/logs/gateway-structured.log" 2>/dev/null > "$FD/gateway-structured.log.tail" || true
+
+# The reason a boot was refused, pulled out of the structured log so the forensics
+# dir is readable without grepping JSON.
+grep -h -o '"message":"[^"]*\(did not complete cleanly\|The CLI command failed\|Reason:\)[^"]*"' \
+  "$OPENCLAW_DIR/logs/gateway-structured.log" 2>/dev/null | tail -20 > "$FD/startup-failure-reasons.txt" || true
 
 # Config snapshot
 cp "$OPENCLAW_DIR/openclaw.json" "$FD/openclaw.json.at-rollback" 2>/dev/null || true

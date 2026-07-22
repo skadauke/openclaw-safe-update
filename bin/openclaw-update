@@ -38,6 +38,9 @@ Commands:
   check [--json]                 Compare current version with npm latest
   status [--json]                Show current/previous/staged versions and drift
   stage <version|latest>         npm install --prefix ~/.openclaw/versions/<v> openclaw@<v>
+  preflight <version|latest> [--json] [--port N]
+                                 Boot the staged version against an APFS clone of your REAL state dir.
+                                 Catches startup-migration and plugin peer-link failures sandbox-test cannot see.
   sandbox-test <version|latest> [--config-source <path>]
                                  Boot staged version on an alternate port/config and smoketest it.
                                  --config-source <path>: dry-run a proposed openclaw.json edit before applying to live.
@@ -67,7 +70,7 @@ Environment overrides:
 }
 
 function parse(argv) {
-  const args = { _: [], json: false, yes: false, dryRun: false, quick: false, keep: 3, telegram: true, withModels: false, interpret: false, port: 18790, bonjourWatchSec: 120, verbose: false, skip: [], configSource: null, alertOnFail: false, includeBroken: false, removeVersions: false };
+  const args = { _: [], json: false, yes: false, dryRun: false, quick: false, keep: 3, telegram: true, withModels: false, interpret: false, port: 18790, bonjourWatchSec: 120, verbose: false, skip: [], configSource: null, skipPreflight: false, alertOnFail: false, includeBroken: false, removeVersions: false };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--json') args.json = true;
@@ -80,6 +83,7 @@ function parse(argv) {
     else if (a === '--port') args.port = Number(argv[++i]);
     else if (a === '--bonjour-watch-sec') args.bonjourWatchSec = Number(argv[++i]);
     else if (a === '--config-source') args.configSource = argv[++i];
+    else if (a === '--skip-preflight') args.skipPreflight = true;
     else if (a === '--skip') args.skip = argv[++i].split(',').map(s => s.trim()).filter(Boolean);
     else if (a === '--verbose') args.verbose = true;
     else if (a === '--interpret') args.interpret = true;
@@ -100,8 +104,82 @@ function run(cmd, argv, opts = {}) {
   return r;
 }
 
+// ── Node selection ─────────────────────────────────────────────────────────
+// OpenClaw declares an engines.node range and refuses to boot outside it, and its
+// entry point re-execs `node` resolved from PATH. Running this script via
+// `#!/usr/bin/env node` under an nvm shell therefore picked nvm's node, handed it
+// to the gateway child, and the child died on the version check — which looked
+// exactly like a hang, because nothing reported the child's exit. Pick a node that
+// satisfies the TARGET version's own engines rather than whatever ran us.
+
+function parseVer(s) {
+  const m = String(s || '').match(/(\d+)\.(\d+)\.(\d+)/);
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+}
+
+function cmpVer(a, b) {
+  for (let i = 0; i < 3; i++) if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
+  return 0;
+}
+
+// Handles the npm engines grammar OpenClaw actually uses: comparator clauses
+// joined by spaces (AND), alternatives joined by `||` (OR).
+function satisfiesRange(version, range) {
+  const v = parseVer(version);
+  if (!v || !range) return Boolean(v);
+  return range.split('||').some(clause => clause.trim().split(/\s+/).filter(Boolean).every(cmp => {
+    const m = cmp.match(/^(>=|<=|>|<|=)?\s*v?(\d+\.\d+\.\d+)/);
+    if (!m) return true;
+    const c = cmpVer(v, parseVer(m[2]));
+    switch (m[1]) {
+      case '>=': return c >= 0;
+      case '<=': return c <= 0;
+      case '>': return c > 0;
+      case '<': return c < 0;
+      default: return c === 0;
+    }
+  }));
+}
+
+function enginesFor(version) {
+  const pkg = version
+    ? resolve(VERSIONS_DIR, version, 'node_modules/openclaw/package.json')
+    : resolve(CURRENT_LINK, 'node_modules/openclaw/package.json');
+  try { return JSON.parse(readFileSync(pkg, 'utf8'))?.engines?.node ?? null; } catch { return null; }
+}
+
+function nodeCandidates() {
+  const out = [];
+  const push = p => { if (p && !out.includes(p) && existsSync(p)) out.push(p); };
+  push(process.env.OPENCLAW_NODE);
+  push(process.execPath);
+  push('/opt/homebrew/bin/node');
+  push('/usr/local/bin/node');
+  const r = spawnSync('which', ['-a', 'node'], { encoding: 'utf8', timeout: 5000 });
+  if (r.status === 0) for (const line of (r.stdout || '').split('\n')) push(line.trim());
+  return out;
+}
+
+// Highest satisfying candidate wins, so a too-old nvm node never shadows a good one.
+function resolveNode(version) {
+  const range = enginesFor(version);
+  const scored = nodeCandidates().map(p => {
+    const q = spawnSync(p, ['-v'], { encoding: 'utf8', timeout: 5000 });
+    return { path: p, ver: q.status === 0 ? parseVer(q.stdout) : null };
+  }).filter(c => c.ver && satisfiesRange(c.ver.join('.'), range));
+  scored.sort((a, b) => cmpVer(b.ver, a.ver));
+  return scored[0]?.path ?? (process.env.OPENCLAW_NODE || process.execPath);
+}
+
+// Pin the chosen node's dir first so OpenClaw's PATH-based respawn lands on it too.
+function pinNodeFor(version) {
+  NODE = resolveNode(version);
+  process.env.PATH = `${dirname(NODE)}:${process.env.PATH ?? ''}`;
+  return NODE;
+}
+
 function detectInstall() {
-  const node = process.env.OPENCLAW_NODE || process.execPath;
+  const node = resolveNode();
 
   let npm;
   if (process.env.OPENCLAW_NPM) {
@@ -128,7 +206,8 @@ function detectInstall() {
   return { NODE: node, NPM: npm, INSTALL_DIR: installDir };
 }
 
-const { NODE, NPM, INSTALL_DIR } = detectInstall();
+let { NODE, NPM, INSTALL_DIR } = detectInstall();
+process.env.PATH = `${dirname(NODE)}:${process.env.PATH ?? ''}`;
 
 function versionFromOutput(s) {
   return (s || '').match(/(\d{4}\.\d+\.\d+)/)?.[1] ?? null;
@@ -249,16 +328,44 @@ function fetchChangelog(version) {
   return r.stdout;
 }
 
+function releasesBetween(current, latest) {
+  const r = run(NPM, ['view', 'openclaw', 'time', '--json'], { timeout: 60000 });
+  if (r.status !== 0) return [latest];
+  let times;
+  try { times = JSON.parse(r.stdout); } catch { return [latest]; }
+  const tCur = Date.parse(times[current] ?? '');
+  const tLat = Date.parse(times[latest] ?? '');
+  if (!tCur || !tLat) return [latest];
+  const versions = Object.entries(times)
+    .filter(([v]) => v !== 'created' && v !== 'modified')
+    // Keep `-1`/`-2` correction releases; drop alpha/beta/rc trains, which are
+    // superseded by the stable release that follows them.
+    .filter(([v]) => !/-(alpha|beta|rc)\./i.test(v))
+    .filter(([, t]) => { const ms = Date.parse(t); return ms > tCur && ms <= tLat; })
+    .sort((a, b) => Date.parse(a[1]) - Date.parse(b[1]))
+    .map(([v]) => v);
+  return versions.length ? versions : [latest];
+}
+
+// Each release tarball ships only its own notes, so slicing one changelog between
+// two version headings yielded a stub whenever the span crossed releases. Walk the
+// releases in the span and concatenate.
 function changelogDiff(latest, current) {
-  const cl = fetchChangelog(latest);
-  const startIdx = cl.indexOf(`## ${latest}`);
-  const endIdx = cl.indexOf(`## ${current}`);
   const MAX = 40000;
-  if (startIdx === -1) return cl.slice(0, Math.min(cl.length, MAX));
-  const raw = (endIdx === -1 || endIdx < startIdx)
-    ? cl.slice(startIdx)
-    : cl.slice(startIdx, endIdx);
-  return raw.slice(0, MAX).trim();
+  const chunks = [];
+  for (const v of releasesBetween(current, latest)) {
+    let cl;
+    try { cl = fetchChangelog(v); } catch { continue; }
+    const start = cl.indexOf(`## ${v}`);
+    if (start === -1) { const t = cl.trim(); if (t) chunks.push(t); continue; }
+    // Older tarballs were cumulative — stop at the next release heading if present.
+    const next = cl.indexOf('\n## ', start + 1);
+    const body = (next === -1 ? cl.slice(start) : cl.slice(start, next)).trim();
+    if (body) chunks.push(body);
+  }
+  if (!chunks.length) return '';
+  chunks.reverse(); // newest first, so truncation drops the oldest notes
+  return chunks.join('\n\n').slice(0, MAX).trim();
 }
 
 function interpretPrompt(current, latest) {
@@ -406,6 +513,7 @@ function writeSandboxConfig(sandboxDir, port, configSource) {
 
 async function runSandboxTestCore(args, version) {
   if (!existsSync(packageDir(version))) cmdStage({ ...args, _: ['stage', version] });
+  pinNodeFor(version);
   const installDir = packageDir(version);
   if (!existsSync(resolve(installDir, 'dist/index.js'))) throw new Error(`staged install is missing dist/index.js: ${installDir}`);
 
@@ -429,8 +537,15 @@ async function runSandboxTestCore(args, version) {
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: true,
   });
+  let stderrTail = '';
   child.stdout.on('data', d => writeFileSync(out, d, { flag: 'a' }));
-  child.stderr.on('data', d => writeFileSync(err, d, { flag: 'a' }));
+  child.stderr.on('data', d => { stderrTail = (stderrTail + d).slice(-2000); writeFileSync(err, d, { flag: 'a' }); });
+
+  // A gateway that dies at startup used to look like a hang: every remaining test
+  // burned its full timeout in silence. Record the exit so we can stop immediately
+  // and show why.
+  let exitInfo = null;
+  child.on('exit', (code, signal) => { exitInfo = { code, signal }; });
 
   let report;
   try {
@@ -445,6 +560,10 @@ async function runSandboxTestCore(args, version) {
       bonjourWatchSec: args.bonjourWatchSec,
       verbose: args.verbose,
       skip: args.skip,
+      onResult: args.json ? null : (r) => console.log(`  ${r.ok ? '✓' : '✗'} ${r.id}-${r.name} (${r.duration_ms}ms)${r.detail ? '  — ' + r.detail : ''}`),
+      abortIf: () => exitInfo
+        ? `sandbox gateway exited early (code=${exitInfo.code}, signal=${exitInfo.signal})\n--- gateway stderr ---\n${stderrTail.trim() || '(empty)'}`
+        : null,
     });
   } finally {
     try { process.kill(-child.pid, 'SIGTERM'); } catch {}
@@ -458,8 +577,10 @@ async function cmdSandboxTest(args) {
   const version = resolveRequestedVersion(requested);
   const { report, sandboxDir } = await runSandboxTestCore(args, version);
   if (args.json) console.log(JSON.stringify({ version, sandboxDir, report }, null, 2));
-  else console.log(formatTextReport(report));
-  process.exit(report?.failed ? 1 : 0);
+  // Per-test lines already streamed via onResult; just add the tally.
+  else console.log(`${report.passed} passed, ${report.failed} failed, ${report.skipped} skipped`);
+  if (report?.aborted) console.error(`\nAborted: ${report.aborted}`);
+  process.exit(report?.failed || report?.aborted ? 1 : 0);
 }
 
 async function cmdSmoketest(args) {
@@ -556,6 +677,116 @@ function assertBonjourDisabled() {
   console.log(`Bonjour guard: env=${envGuard ? 'on' : 'off'} config=${configGuard ? 'on' : 'off'}`);
 }
 
+// Top-level ~/.openclaw entries the migration preflight does not need. Everything
+// else is cloned so the staged version meets the same legacy sidecars it will meet
+// on the real boot. `cron` is excluded deliberately: it is not a migration source,
+// and a cloned gateway that inherits due jobs would fire them for real.
+//
+// `npm` must NOT be excluded: it holds the installed external plugins. Without it
+// the config preflight takes an "install missing plugin" branch and never reaches
+// the state-migration gate we are trying to test — a silent false pass.
+const PREFLIGHT_SKIP = new Set(['versions', 'media', 'cache', 'browser', 'cron']);
+const PREFLIGHT_SKIP_PREFIXES = ['.state-pre-restore-', '.doctor-fix-snapshots'];
+
+// The sandbox test boots on an empty OPENCLAW_HOME, so startup migrations have
+// nothing to migrate and failures there are structurally invisible — that is how
+// 2026.7.1-2 passed sandbox and then refused to report ready on the real state.
+// This boots the staged version against an APFS clone of the live state dir:
+// faithful legacy sidecars, zero writes to the real one, and cheap because
+// clonefile shares blocks until written.
+async function runMigrationPreflight(args, requested) {
+  const version = resolveRequestedVersion(requested);
+  if (!existsSync(packageDir(version))) cmdStage({ ...args, _: ['stage', version] });
+  pinNodeFor(version);
+  const installDir = packageDir(version);
+  if (!existsSync(resolve(installDir, 'dist/index.js'))) throw new Error(`staged install is missing dist/index.js: ${installDir}`);
+
+  const homeDir = mkdtempSync(resolve(tmpdir(), `openclaw-preflight-${version}-`));
+  console.log(`Cloning live state → ${homeDir}`);
+  const t0 = Date.now();
+  for (const entry of readdirSync(OPENCLAW_DIR)) {
+    if (PREFLIGHT_SKIP.has(entry)) continue;
+    if (PREFLIGHT_SKIP_PREFIXES.some(p => entry.startsWith(p))) continue;
+    // -c requests APFS clonefile: near-instant, no extra disk until written.
+    const r = spawnSync('cp', ['-Rc', resolve(OPENCLAW_DIR, entry), resolve(homeDir, entry)], { encoding: 'utf8', timeout: 300000 });
+    if (r.status !== 0) console.log(`  clone warning: ${entry} (${(r.stderr || '').trim().split('\n')[0] || `exit ${r.status}`})`);
+  }
+  mkdirSync(resolve(homeDir, 'logs'), { recursive: true });
+  console.log(`Cloned in ${Math.round((Date.now() - t0) / 1000)}s`);
+
+  // Reuse the sandbox hardening: alternate port, no auth, no channels, no
+  // Tailscale/mDNS. Written before the repair below so nothing in this rehearsal
+  // ever runs against the live bot tokens.
+  const cfgPath = writeSandboxConfig(homeDir, args.port, resolve(OPENCLAW_DIR, 'openclaw.json'));
+  // OPENCLAW_STATE_DIR is what actually redirects state: the migration resolves
+  // legacy sidecars as <stateDir>/plugin-state/state.sqlite. With only
+  // OPENCLAW_HOME set, the boot still reads the REAL state dir — both unsafe and
+  // a false pass, since it cannot see the clone's sidecars.
+  const cloneEnv = { ...process.env, OPENCLAW_HOME: homeDir, OPENCLAW_STATE_DIR: homeDir, OPENCLAW_CONFIG_PATH: cfgPath, OPENCLAW_DISABLE_BONJOUR: '1' };
+
+  // Simulate the post-promote world, not the pre-promote one: point the clone's
+  // `current` at the staged version. External plugins pin an absolute peer link
+  // to whatever `current` was when they were installed, so this is what exposes
+  // peer-link drift.
+  run('ln', ['-sfn', versionDir(version), resolve(homeDir, 'current')]);
+
+  // Mirror what promote does after the swap: relink external plugins against the
+  // new runtime, or the startup guard rejects them.
+  console.log('Running plugin convergence repair against the clone ...');
+  const repair = spawnSync(NODE, [resolve(installDir, 'dist/index.js'), 'update', 'repair', '--yes'], { env: cloneEnv, encoding: 'utf8', timeout: 900000 });
+  if (repair.status !== 0) console.log(`  repair warning: exit ${repair.status} (continuing; the boot below is the real verdict)`);
+
+  const err = resolve(homeDir, 'gateway.err.log');
+  console.log(`Booting openclaw@${version} against cloned state on port ${args.port} ...`);
+  const child = spawn(NODE, [resolve(installDir, 'dist/index.js'), 'gateway', 'run', '--port', String(args.port), '--bind', 'loopback'], {
+    env: { ...cloneEnv, OPENCLAW_GATEWAY_PORT: String(args.port) },
+    stdio: ['ignore', 'pipe', 'pipe'],
+    detached: true,
+  });
+  let stderrAll = '';
+  child.stdout.on('data', d => { stderrAll += d; });
+  child.stderr.on('data', d => { stderrAll += d; writeFileSync(err, d, { flag: 'a' }); });
+  let exitInfo = null;
+  child.on('exit', (code, signal) => { exitInfo = { code, signal }; });
+
+  const deadline = Date.now() + 90000;
+  let healthy = false;
+  while (Date.now() < deadline && !exitInfo) {
+    try {
+      const res = await fetch(`http://127.0.0.1:${args.port}/healthz`);
+      if (res.ok) { healthy = true; break; }
+    } catch {}
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  try { process.kill(-child.pid, 'SIGTERM'); } catch {}
+  setTimeout(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch {} }, 3000).unref();
+
+  // The migration guard is the failure we are hunting: it exits non-zero rather
+  // than serving /healthz, and names the offending sidecars in its reason.
+  const migrationGate = /startup migrations did not complete cleanly/i.test(stderrAll);
+  const warnings = [...new Set([...stderrAll.matchAll(/^- (Left .+|Plugin ".+)$/gm)].map(m => m[1]))];
+  const result = { version, ok: healthy, migrationGate, warnings, homeDir, stderr: stderrAll.trim().slice(-2000) };
+
+  if (healthy) {
+    console.log(`✓ migration preflight passed — ${version} completed startup migrations against real state`);
+    if (warnings.length) for (const w of warnings) console.log(`  note: ${w}`);
+    rmSync(homeDir, { recursive: true, force: true });
+  } else {
+    console.error(`✗ migration preflight FAILED — ${version} would not boot on your real state`);
+    if (migrationGate) console.error('  cause: startup migration guard refused to report the gateway ready');
+    for (const w of warnings) console.error(`  - ${w}`);
+    if (!warnings.length) console.error(`--- gateway stderr ---\n${result.stderr || '(empty)'}`);
+    console.error(`  clone kept for inspection: ${homeDir}`);
+  }
+  return result;
+}
+
+async function cmdPreflight(args) {
+  const result = await runMigrationPreflight(args, args._[1] || 'latest');
+  if (args.json) console.log(JSON.stringify(result, null, 2));
+  process.exit(result.ok ? 0 : 1);
+}
+
 async function cmdPromote(args) {
   const version = args._[1];
   if (!version) throw new Error('promote requires <version>');
@@ -568,6 +799,15 @@ async function cmdPromote(args) {
   const oldVersion = oldTarget ? basename(oldTarget) : currentVersion();
   if (!args.stepBase) console.log(`Promoting ${oldVersion ?? 'unknown'} → ${version}`);
   if (args.dryRun) { console.log(`[dry-run] would set current -> versions/${version}, restart gateway, run smoketest`); return; }
+
+  // Cheapest possible failure: catch a startup-migration gate here, on a clone,
+  // instead of after bootout — where the only exit is a 30s health timeout and an
+  // auto-rollback that undoes the whole promote.
+  if (!args.skipPreflight) {
+    const pf = await runMigrationPreflight(args, version);
+    if (!pf.ok) throw new Error(`migration preflight failed for ${version}; live gateway untouched. Fix the reported state, or re-run with --skip-preflight to override.`);
+  }
+  pinNodeFor(version);
 
   mkdirSync(OPENCLAW_DIR, { recursive: true });
   if (oldTarget) {
@@ -606,6 +846,14 @@ async function cmdPromote(args) {
   run('ln', ['-sfn', `versions/${version}`, 'current']);
   if (args.stepBase) console.log(`[${args.stepBase}b/6]   Swapping symlink → current → ${version}`);
   addEvent({ event: 'promote', current: version, previous: oldVersion, path: target, clawdTag });
+
+  // External plugins hold an ABSOLUTE peer link to the openclaw runtime they were
+  // installed against. The swap above makes those links stale, and the startup
+  // guard rejects a stale peer link — so the gateway would refuse to come up and
+  // auto-rollback would undo the promote. Relink before restart.
+  const repair = spawnSync(NODE, [resolve(packageDir(version), 'dist/index.js'), 'update', 'repair', '--yes'], { encoding: 'utf8', timeout: 900000 });
+  if (args.stepBase) console.log(`[${args.stepBase}b2/6]  Converging plugins → ${repair.status === 0 ? 'ok' : `exit ${repair.status} (continuing)`}`);
+  else console.log(repair.status === 0 ? 'Plugins converged against the new runtime.' : `  update repair exited ${repair.status}; continuing — the post-promote smoketest is the gate.`);
 
   let smoketestReport = null;
   try {
@@ -710,6 +958,10 @@ async function cmdInteractive(args) {
     const { report } = await runSandboxTestCore({ ...args, _: ['sandbox-test', latest] }, latest);
     const passed = report.passed, total = report.passed + report.failed;
     console.log(`[3/6] Sandbox smoke test: ${passed}/${total} passed`);
+    if (report.aborted) {
+      console.error(`Sandbox smoke test aborted: ${report.aborted}`);
+      process.exit(1);
+    }
     if (report.failed) {
       console.error(`Sandbox smoke test had ${report.failed} failure(s). Not promoting.`);
       console.error(`Fix the issue or skip specific tests with --skip <ids> and re-run.`);
@@ -1000,6 +1252,7 @@ async function main() {
   else if (cmd === 'status') cmdStatus(args);
   else if (cmd === 'stage') cmdStage(args);
   else if (cmd === 'sandbox-test') await cmdSandboxTest(args);
+  else if (cmd === 'preflight') await cmdPreflight(args);
   else if (cmd === 'smoketest') await cmdSmoketest(args);
   else if (cmd === 'promote') await cmdPromote(args);
   else if (cmd === 'rollback') cmdRollback(args);
