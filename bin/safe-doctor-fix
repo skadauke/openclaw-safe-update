@@ -35,6 +35,18 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const SAFE_STATE = resolve(HERE, 'safe-state');
 const OPENCLAW_DIR = resolve(homedir(), '.openclaw');
 const TRANSCRIPT_DIR = resolve(OPENCLAW_DIR, 'logs/doctor-fix');
+const NODE = '/opt/homebrew/bin/node';
+
+// Bare `node`/`openclaw` resolve against the caller's PATH, which lands on an
+// nvm node or the deprecated brew binary (exit 64) depending on the shell. Pin
+// both: our own node first, and the versioned install `current` points at.
+process.env.PATH = `${dirname(NODE)}:${process.env.PATH ?? ''}`;
+
+function openclawEntry() {
+  const entry = resolve(OPENCLAW_DIR, 'current/node_modules/openclaw/dist/index.js');
+  if (!existsSync(entry)) throw new Error(`cannot find the versioned openclaw install at ${entry}`);
+  return entry;
+}
 
 // ─── safe-state delegation ─────────────────────────────────────────────────
 // Snapshot/restore is fully delegated to safe-state (git-backed). The old
@@ -43,7 +55,7 @@ const TRANSCRIPT_DIR = resolve(OPENCLAW_DIR, 'logs/doctor-fix');
 // guess which paths doctor will touch.
 
 function safeState(args, opts = {}) {
-  const r = spawnSync('node', [SAFE_STATE, ...args], {
+  const r = spawnSync(NODE, [SAFE_STATE, ...args], {
     encoding: 'utf8',
     timeout: opts.timeout ?? 60000,
     stdio: opts.stdio ?? ['ignore', 'pipe', 'pipe'],
@@ -249,7 +261,7 @@ function runDoctor(args, transcriptPath) {
   out.write(`# safe-doctor-fix ${new Date().toISOString()}\n# argv: ${JSON.stringify(flags)}\n\n`);
   // Hard-kill if doctor wedges; for non-interactive use this should never trigger.
   const HARD_TIMEOUT_MS = args.dryRun ? 30000 : 300000;
-  const child = spawn('openclaw', flags, { stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(NODE, [openclawEntry(), ...flags], { stdio: ['ignore', 'pipe', 'pipe'] });
   let jsonBuf = '';
   child.stdout.on('data', c => { if (args.dryRun) jsonBuf += c.toString(); else process.stdout.write(c); out.write(c); });
   child.stderr.on('data', c => { process.stderr.write(c); out.write(c); });

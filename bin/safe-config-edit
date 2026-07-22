@@ -25,6 +25,10 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const SAFE_STATE = resolve(HERE, 'safe-state');
 const OPENCLAW_DIR = resolve(homedir(), '.openclaw');
 const CFG_PATH = resolve(OPENCLAW_DIR, 'openclaw.json');
+// Bare `node` resolves against the caller's PATH, which may lead with an nvm
+// version too old for the gateway. Pin ours for this process and its children.
+const NODE = '/opt/homebrew/bin/node';
+process.env.PATH = `${dirname(NODE)}:${process.env.PATH ?? ''}`;
 // 5.28 split logs: plaintext gateway.err.log is mostly dead, real errors go to
 // gateway-structured.log (JSON). Scan both — regex still matches against raw
 // JSON because the message text is in the "message" field as a substring.
@@ -40,7 +44,7 @@ const ERR_LOGS = [
 // somehow corrupted.
 
 function safeState(args, opts = {}) {
-  const r = spawnSync('node', [SAFE_STATE, ...args], {
+  const r = spawnSync(NODE, [SAFE_STATE, ...args], {
     encoding: 'utf8',
     timeout: opts.timeout ?? 60000,
     stdio: opts.stdio ?? ['ignore', 'pipe', 'pipe'],
