@@ -42,9 +42,16 @@ const NODE = '/opt/homebrew/bin/node';
 // both: our own node first, and the versioned install `current` points at.
 process.env.PATH = `${dirname(NODE)}:${process.env.PATH ?? ''}`;
 
+// Two install layouts exist in the wild: the plain npm-prefix one and the older
+// `lib/node_modules` one (which is what the launchd plist still points at). Check
+// both, the same way openclaw-update's packageDir() does.
 function openclawEntry() {
-  const entry = resolve(OPENCLAW_DIR, 'current/node_modules/openclaw/dist/index.js');
-  if (!existsSync(entry)) throw new Error(`cannot find the versioned openclaw install at ${entry}`);
+  const candidates = [
+    resolve(OPENCLAW_DIR, 'current/node_modules/openclaw/dist/index.js'),
+    resolve(OPENCLAW_DIR, 'current/lib/node_modules/openclaw/dist/index.js'),
+  ];
+  const entry = candidates.find(p => existsSync(p));
+  if (!entry) throw new Error(`cannot find the versioned openclaw install; tried:\n  ${candidates.join('\n  ')}`);
   return entry;
 }
 
