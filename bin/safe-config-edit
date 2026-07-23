@@ -199,6 +199,23 @@ function detectFatal(newText) {
   return { count: fatal.length, sample: uniq[uniq.length - 1] };
 }
 
+// Post-restart relay kick — see safe-restart for rationale: the chrome-extension
+// relay (18799) lazy-starts and stays down after any gateway restart until the
+// browser subsystem is touched. Non-fatal no-op when no extension profile exists.
+function kickBrowserRelay() {
+  try {
+    const cfg = JSON.parse(readFileSync(resolve(OPENCLAW_DIR, 'openclaw.json'), 'utf8'));
+    const profiles = cfg?.browser?.profiles ?? {};
+    const name = Object.keys(profiles).find(p => profiles[p]?.driver === 'extension');
+    if (!name) return;
+    const bin = resolve(OPENCLAW_DIR, 'bin/openclaw');
+    spawnSync(bin, ['browser', 'start', '--browser-profile', name], { encoding: 'utf8', timeout: 30000 });
+    console.log(`\u2713 browser extension relay kicked (profile "${name}", port 18799)`);
+  } catch (err) {
+    process.stderr.write(`[safe-config-edit] relay kick skipped (non-fatal): ${err.message}\n`);
+  }
+}
+
 async function waitHealthy(maxSec = 60, errBaseline = null) {
   // errBaseline MUST be captured BEFORE kickstart by the caller. 5.28's
   // launchd retries are throttled — if the new process writes fatal lines
@@ -267,6 +284,7 @@ async function doEdit(args) {
   const h = await waitHealthy(60, errBaseline1);
   if (h.ok) {
     console.log(`✓ gateway healthy in ${h.elapsed}s`);
+    kickBrowserRelay();
     await notify(`✅ OpenClaw config edit "${args.note}" applied; gateway healthy in ${h.elapsed}s. Backup: ${basename(backup)}. Revert: safe-config-edit --rollback`);
     console.log(`To revert: safe-config-edit --rollback`);
     return;
@@ -290,6 +308,7 @@ async function doEdit(args) {
   const h2 = await waitHealthy(60, errBaseline2);
   if (h2.ok) {
     console.error(`✓ rolled back; gateway healthy in ${h2.elapsed}s`);
+    kickBrowserRelay();
     const reason = h.fastFail
       ? `fast-fail after ${h.elapsed}s: ${h.lastErr}`
       : h.lastErr;

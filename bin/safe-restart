@@ -19,7 +19,7 @@
 // Run it from a terminal, not from an assistant tool call.
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
+import { existsSync, statSync, openSync, readSync, closeSync, readFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -196,6 +196,30 @@ async function waitHealthy(maxSec, errBaseline) {
   return { ok: false, lastErr };
 }
 
+// The chrome-extension relay (port 18799) lives in the browser control
+// service, which lazy-starts on first browser use — a fresh gateway leaves it
+// down and the Chrome extension shows "relay unreachable" until something
+// touches the browser. OPENCLAW_EAGER_BROWSER_CONTROL_SERVER only starts the
+// control HTTP server, NOT the relay (verified 2026-07-22, v2026.7.1-2). So
+// after a healthy restart, kick the chrome profile to bring the relay up.
+// Non-fatal: skips silently when no extension profile is configured.
+function kickBrowserRelay() {
+  try {
+    const cfg = JSON.parse(readFileSync(resolve(OPENCLAW_DIR, 'openclaw.json'), 'utf8'));
+    const profiles = cfg?.browser?.profiles ?? {};
+    const name = Object.keys(profiles).find(p => profiles[p]?.driver === 'extension');
+    if (!name) return;
+    const bin = resolve(OPENCLAW_DIR, 'bin/openclaw');
+    // `browser start` errors if the extension isn't connected yet, but starting
+    // the control service (which binds the relay) is a side effect that happens
+    // regardless — ignore the exit code.
+    spawnSync(bin, ['browser', 'start', '--browser-profile', name], { encoding: 'utf8', timeout: 30000 });
+    console.log(`✓ browser extension relay kicked (profile "${name}", port 18799)`);
+  } catch (err) {
+    process.stderr.write(`[safe-restart] relay kick skipped (non-fatal): ${err.message}\n`);
+  }
+}
+
 async function main() {
   const args = parse(process.argv);
 
@@ -204,6 +228,7 @@ async function main() {
     if (args.snapshot) console.log(`  1. safe-state snapshot restart-${args.reason}`);
     console.log(`  ${args.snapshot ? 2 : 1}. launchctl kickstart -k gui/${process.getuid()}/${GATEWAY_LABEL}`);
     console.log(`  ${args.snapshot ? 3 : 2}. poll http://127.0.0.1:${PORT}/healthz for up to ${args.timeout}s`);
+    console.log(`  ${args.snapshot ? 4 : 3}. kick the chrome-extension browser relay (if an extension profile is configured)`);
     return;
   }
 
@@ -220,6 +245,7 @@ async function main() {
   const h = await waitHealthy(args.timeout, errBaseline);
   if (h.ok) {
     console.log(`✓ gateway healthy in ${h.elapsed}s`);
+    kickBrowserRelay();
     await notify(`✅ OpenClaw gateway restarted ("${args.reason}"); healthy in ${h.elapsed}s`);
     return;
   }
